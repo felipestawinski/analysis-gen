@@ -2,6 +2,7 @@
 
 ## Overview
 This project is a FastAPI application designed to handle the uploading of Excel files. It provides an endpoint for users to upload `.xlsx` files, which are then validated and saved to the server.
+This is part of the KPI project.
 
 ## Project Structure
 ```

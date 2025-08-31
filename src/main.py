@@ -3,7 +3,7 @@ import uvicorn
 
 app = FastAPI()
 
-@app.post("/upload-excel/")
+@app.post("/analysis-gen")
 async def upload_excel(file: UploadFile = File(...)):
     if not file.filename.endswith(".xlsx"):
         return {"error": "Only .xlsx files are allowed"}

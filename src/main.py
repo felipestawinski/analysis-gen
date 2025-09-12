@@ -4,6 +4,9 @@ import uvicorn
 import httpx
 import csv
 import io
+import matplotlib.pyplot as plt
+import pandas as pd
+import base64
 
 
 app = FastAPI()
@@ -28,12 +31,40 @@ async def download_csv(request: URLRequest):
         csv_content = response.text
         csv_reader = csv.reader(io.StringIO(csv_content))
         row_count = sum(1 for row in csv_reader)
+
         
-        return {
-            "url": str(request.fileAddress),
-            "length": row_count,
-            "message": "CSV file processed successfully"
-        }
+
+        df = pd.read_csv(io.StringIO(csv_content))
+        print(df.head())
+
+        print(type(csv_reader))
+
+        if ' Position' in df.columns:
+            position_counts = df[' Position'].value_counts()
+            ax = position_counts.plot(kind='bar')
+            fig = ax.get_figure()
+            
+            # Save figure to bytes buffer
+            img_buffer = io.BytesIO()
+            fig.savefig(img_buffer, format='png')
+            img_buffer.seek(0)
+            
+            # Convert to base64
+            img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+            
+            # Close the figure to free memory
+            plt.close(fig)
+            
+            return {
+                "fig": f"data:image/png;base64,{img_base64}",
+            }
+        else:
+            print("Column 'Position' does not exist in the DataFrame.")
+            return {
+                "url": str(request.fileAddress),
+                "length": row_count,
+                "message": "CSV file processed successfully - No Position column found"
+            }
     
     except httpx.RequestError as e:
         raise HTTPException(status_code=400, detail=f"Error downloading file: {str(e)}")

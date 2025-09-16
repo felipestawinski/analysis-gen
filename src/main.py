@@ -58,6 +58,26 @@ async def download_csv(request: URLRequest):
             return {
                 "fig": f"data:image/png;base64,{img_base64}",
             }
+        elif 'Goals' in df.columns:
+            print("aqui")
+            goals_counts = df['Goals'].value_counts()
+            ax = goals_counts.plot(kind='bar')
+            fig = ax.get_figure()
+            
+            # Save figure to bytes buffer
+            img_buffer = io.BytesIO()
+            fig.savefig(img_buffer, format='png')
+            img_buffer.seek(0)
+            
+            # Convert to base64
+            img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+            
+            # Close the figure to free memory
+            plt.close(fig)
+            
+            return {
+                "fig": f"data:image/png;base64,{img_base64}",
+            }
         else:
             print("Column 'Position' does not exist in the DataFrame.")
             return {

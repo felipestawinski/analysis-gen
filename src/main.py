@@ -13,11 +13,13 @@ app = FastAPI()
 
 class URLRequest(BaseModel):
     fileAddress: HttpUrl
+    prompt: str
 
 @app.post("/analysis-gen")
 async def download_csv(request: URLRequest):
     try:
         print("teste")
+        print(request.prompt)
         async with httpx.AsyncClient() as client:
             response = await client.get(str(request.fileAddress))
             response.raise_for_status()
@@ -87,6 +89,7 @@ async def download_csv(request: URLRequest):
             }
     
     except httpx.RequestError as e:
+        print('erro ao baixar o arquivo')
         raise HTTPException(status_code=400, detail=f"Error downloading file: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")

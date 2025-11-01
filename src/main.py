@@ -24,6 +24,77 @@ class URLRequest(BaseModel):
     fileAddress: HttpUrl
     prompt: str
 
+def detect_language(text: str) -> str:
+    """
+    Simple language detection based on common Portuguese words
+    """
+    portuguese_indicators = [
+        'qual', 'quem', 'onde', 'quando', 'como', 'por que', 'porque',
+        'jogador', 'melhor', 'maior', 'menor', 'média', 'total',
+        'gols', 'pontos', 'time', 'equipe', 'artilheiro', 'temporada'
+    ]
+    
+    text_lower = text.lower()
+    portuguese_count = sum(1 for word in portuguese_indicators if word in text_lower)
+    
+    return 'pt' if portuguese_count > 0 else 'en'
+
+def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str) -> str:
+    """
+    Send dataframe info and user prompt to OpenAI for analysis with fallback options
+    """
+    # Create a summary of the dataframe
+    df_info = {
+        "shape": df.shape,
+        "columns": list(df.columns),
+        "dtypes": df.dtypes.to_dict(),
+        "sample_data": df.head().to_dict(),
+        "basic_stats": df.describe().to_dict() if len(df.select_dtypes(include='number').columns) > 0 else None
+    }
+    
+    system_prompt = """You are a data analyst expert. Analyze the provided CSV data and answer the user's question.
+    IMPORTANT: Always respond in the same language as the user's question. If the user asks in Portuguese, respond in Portuguese. If in English, respond in English. If in Spanish, respond in Spanish, etc.
+    Provide clear, concise insights based on the data."""
+    
+    user_message = f"""
+    Dataset Information:
+    - Shape: {df_info['shape']} (rows, columns)
+    - Columns: {df_info['columns']}
+    - Data types: {df_info['dtypes']}
+    - Sample data: {df_info['sample_data']}
+    - Basic statistics: {df_info['basic_stats']}
+    
+    User Question: {user_prompt}
+    
+    Please provide a detailed analysis answering the user's question in the same language as the question above.
+    """
+    
+    # Try OpenAI first
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                max_tokens=2000,
+                temperature=0.3
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"OpenAI failed: {str(e)}")
+            # Fall through to alternatives
+    
+    # Try Hugging Face as backup
+    if os.getenv("HUGGINGFACE_API_KEY"):
+        hf_result = analyze_dataframe_with_huggingface(df, user_prompt)
+        if not hf_result.startswith("Error") and not hf_result.startswith("Hugging Face API error"):
+            return hf_result
+    
+    # Use fallback analysis
+    return analyze_dataframe_fallback(df, user_prompt)
+
 def analyze_dataframe_with_huggingface(df: pd.DataFrame, user_prompt: str) -> str:
     """
     Use Hugging Face's free API as an alternative to OpenAI
@@ -35,17 +106,33 @@ def analyze_dataframe_with_huggingface(df: pd.DataFrame, user_prompt: str) -> st
         "sample_data": df.head(3).to_dict(),  # Reduced sample to save tokens
     }
     
-    prompt = f"""
-    Analyze this CSV data and answer the question:
+    # Detect language and adjust prompt
+    lang = detect_language(user_prompt)
     
-    Data info: {df.shape[0]} rows, {df.shape[1]} columns
-    Columns: {list(df.columns)}
-    Sample: {df_info['sample_data']}
-    
-    Question: {user_prompt}
-    
-    Provide a clear analysis with specific findings.
-    """
+    if lang == 'pt':
+        prompt = f"""
+        Analise estes dados CSV e responda à pergunta:
+        
+        Informações dos dados: {df.shape[0]} linhas, {df.shape[1]} colunas
+        Colunas: {list(df.columns)}
+        Amostra: {df_info['sample_data']}
+        
+        Pergunta: {user_prompt}
+        
+        Forneça uma análise clara com descobertas específicas em português.
+        """
+    else:
+        prompt = f"""
+        Analyze this CSV data and answer the question:
+        
+        Data info: {df.shape[0]} rows, {df.shape[1]} columns
+        Columns: {list(df.columns)}
+        Sample: {df_info['sample_data']}
+        
+        Question: {user_prompt}
+        
+        Provide a clear analysis with specific findings.
+        """
     
     try:
         # Using Hugging Face's free inference API
@@ -67,107 +154,82 @@ def analyze_dataframe_fallback(df: pd.DataFrame, user_prompt: str) -> str:
     """
     Fallback analysis without external APIs - purely based on pandas operations
     """
+    lang = detect_language(user_prompt)
     analysis = []
     
-    # Basic info
-    analysis.append(f"Dataset contains {len(df)} rows and {len(df.columns)} columns.")
-    analysis.append(f"Columns: {', '.join(df.columns)}")
+    # Basic info in detected language
+    if lang == 'pt':
+        analysis.append(f"O conjunto de dados contém {len(df)} linhas e {len(df.columns)} colunas.")
+        analysis.append(f"Colunas: {', '.join(df.columns)}")
+    else:
+        analysis.append(f"Dataset contains {len(df)} rows and {len(df.columns)} columns.")
+        analysis.append(f"Columns: {', '.join(df.columns)}")
     
     # Look for common patterns in the prompt
     prompt_lower = user_prompt.lower()
     
-    if any(word in prompt_lower for word in ['top', 'highest', 'best', 'most']):
+    # Portuguese and English keywords for "top/highest"
+    top_keywords = ['top', 'highest', 'best', 'most', 'maior', 'melhor', 'artilheiro', 'líder']
+    avg_keywords = ['average', 'mean', 'média', 'meio']
+    total_keywords = ['total', 'sum', 'soma', 'somatório']
+    
+    if any(word in prompt_lower for word in top_keywords):
         numeric_cols = df.select_dtypes(include=['number']).columns
         if len(numeric_cols) > 0:
             for col in numeric_cols:
-                if any(keyword in col.lower() for keyword in ['score', 'goal', 'point', 'value']):
+                if any(keyword in col.lower() for keyword in ['score', 'goal', 'point', 'value', 'gol', 'ponto', 'valor']):
                     top_value = df[col].max()
                     top_index = df[col].idxmax()
-                    analysis.append(f"Highest {col}: {top_value}")
+                    
+                    if lang == 'pt':
+                        analysis.append(f"Maior {col}: {top_value}")
+                    else:
+                        analysis.append(f"Highest {col}: {top_value}")
                     
                     # Try to find name column
-                    name_cols = [c for c in df.columns if any(word in c.lower() for word in ['name', 'player', 'team'])]
+                    name_cols = [c for c in df.columns if any(word in c.lower() for word in ['name', 'player', 'team', 'nome', 'jogador', 'time'])]
                     if name_cols:
                         top_name = df.loc[top_index, name_cols[0]]
-                        analysis.append(f"Top performer: {top_name} with {top_value} {col}")
+                        if lang == 'pt':
+                            analysis.append(f"Melhor desempenho: {top_name} com {top_value} {col}")
+                        else:
+                            analysis.append(f"Top performer: {top_name} with {top_value} {col}")
                     break
     
-    elif any(word in prompt_lower for word in ['average', 'mean']):
+    elif any(word in prompt_lower for word in avg_keywords):
         numeric_cols = df.select_dtypes(include=['number']).columns
         for col in numeric_cols:
             avg_val = df[col].mean()
-            analysis.append(f"Average {col}: {avg_val:.2f}")
+            if lang == 'pt':
+                analysis.append(f"Média de {col}: {avg_val:.2f}")
+            else:
+                analysis.append(f"Average {col}: {avg_val:.2f}")
     
-    elif any(word in prompt_lower for word in ['total', 'sum']):
+    elif any(word in prompt_lower for word in total_keywords):
         numeric_cols = df.select_dtypes(include=['number']).columns
         for col in numeric_cols:
             total_val = df[col].sum()
-            analysis.append(f"Total {col}: {total_val}")
+            if lang == 'pt':
+                analysis.append(f"Total de {col}: {total_val}")
+            else:
+                analysis.append(f"Total {col}: {total_val}")
     
     # Add basic statistics
     numeric_cols = df.select_dtypes(include=['number']).columns
     if len(numeric_cols) > 0:
-        analysis.append("\nBasic Statistics:")
-        for col in numeric_cols[:3]:  # Limit to first 3 numeric columns
-            analysis.append(f"{col}: min={df[col].min()}, max={df[col].max()}, avg={df[col].mean():.2f}")
+        if lang == 'pt':
+            analysis.append("\nEstatísticas Básicas:")
+            for col in numeric_cols[:3]:  # Limit to first 3 numeric columns
+                analysis.append(f"{col}: mín={df[col].min()}, máx={df[col].max()}, média={df[col].mean():.2f}")
+        else:
+            analysis.append("\nBasic Statistics:")
+            for col in numeric_cols[:3]:  # Limit to first 3 numeric columns
+                analysis.append(f"{col}: min={df[col].min()}, max={df[col].max()}, avg={df[col].mean():.2f}")
     
-    return "\n".join(analysis) if analysis else "Unable to analyze the data for this specific question."
-
-def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str) -> str:
-    """
-    Send dataframe info and user prompt to OpenAI for analysis with fallback options
-    """
-    # Create a summary of the dataframe
-    df_info = {
-        "shape": df.shape,
-        "columns": list(df.columns),
-        "dtypes": df.dtypes.to_dict(),
-        "sample_data": df.head().to_dict(),
-        "basic_stats": df.describe().to_dict() if len(df.select_dtypes(include='number').columns) > 0 else None
-    }
-    
-    system_prompt = """You are a data analyst expert. Analyze the provided CSV data and answer the user's question.
-    Provide clear, concise insights based on the data. If the question requires visualization, specify what type of chart would be appropriate.
-    Always mention specific numbers and findings from the data."""
-    
-    user_message = f"""
-    Dataset Information:
-    - Shape: {df_info['shape']} (rows, columns)
-    - Columns: {df_info['columns']}
-    - Data types: {df_info['dtypes']}
-    - Sample data: {df_info['sample_data']}
-    - Basic statistics: {df_info['basic_stats']}
-    
-    User Question: {user_prompt}
-    
-    Please provide a detailed analysis answering the user's question.
-    """
-    
-    # Try OpenAI first
-    if os.getenv("OPENAI_API_KEY"):
-        try:
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                max_tokens=1000,
-                temperature=0.3
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"OpenAI failed: {str(e)}")
-            # Fall through to alternatives
-    
-    # Try Hugging Face as backup
-    if os.getenv("HUGGINGFACE_API_KEY"):
-        hf_result = analyze_dataframe_with_huggingface(df, user_prompt)
-        if not hf_result.startswith("Error") and not hf_result.startswith("Hugging Face API error"):
-            return hf_result
-    
-    # Use fallback analysis
-    return analyze_dataframe_fallback(df, user_prompt)
+    if lang == 'pt':
+        return "\n".join(analysis) if analysis else "Não foi possível analisar os dados para esta pergunta específica."
+    else:
+        return "\n".join(analysis) if analysis else "Unable to analyze the data for this specific question."
 
 def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str) -> str:
     """

@@ -48,7 +48,7 @@ def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str) -> str:
         "shape": df.shape,
         "columns": list(df.columns),
         "dtypes": df.dtypes.to_dict(),
-        "sample_data": df.head().to_dict(),
+        "sample_data": df.to_dict(),
         "basic_stats": df.describe().to_dict() if len(df.select_dtypes(include='number').columns) > 0 else None
     }
     

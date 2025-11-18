@@ -11,6 +11,7 @@ import os
 from openai import OpenAI
 from dotenv import load_dotenv
 import requests
+from typing import List
 
 # Load environment variables
 load_dotenv()
@@ -21,7 +22,7 @@ app = FastAPI()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class URLRequest(BaseModel):
-    fileAddress: HttpUrl
+    fileAddresses: List[HttpUrl]
     prompt: str
 
 def detect_language(text: str) -> str:
@@ -304,31 +305,55 @@ def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response:
 async def download_csv(request: URLRequest):
     try:
         print(f"User prompt: {request.prompt}")
+        print(f"Number of files to process: {len(request.fileAddresses)}")
         
-        # Download the CSV file
+        # Download and parse all CSV files
+        dataframes = []
         async with httpx.AsyncClient() as client_http:
-            response = await client_http.get(str(request.fileAddress))
-            response.raise_for_status()
+            for idx, file_address in enumerate(request.fileAddresses):
+                print(f"Downloading file {idx + 1}/{len(request.fileAddresses)}: {file_address}")
+                response = await client_http.get(str(file_address))
+                response.raise_for_status()
+                
+                # Parse CSV
+                csv_content = response.text
+                df = pd.read_csv(io.StringIO(csv_content))
+                print(f"Loaded DataFrame {idx + 1} with shape: {df.shape}")
+                print(f"Columns: {list(df.columns)}")
+                dataframes.append(df)
         
-        # Parse CSV
-        csv_content = response.text
-        df = pd.read_csv(io.StringIO(csv_content))
-        print(f"Loaded DataFrame with shape: {df.shape}")
-        print(f"Columns: {list(df.columns)}")
+        # Combine all dataframes into one
+        if len(dataframes) == 1:
+            combined_df = dataframes[0]
+        else:
+            # Try to concatenate vertically if columns match, otherwise merge horizontally
+            try:
+                combined_df = pd.concat(dataframes, ignore_index=True)
+                print(f"Combined {len(dataframes)} dataframes vertically")
+            except Exception as e:
+                print(f"Could not concatenate vertically: {e}. Attempting horizontal merge...")
+                combined_df = dataframes[0]
+                for df in dataframes[1:]:
+                    combined_df = pd.merge(combined_df, df, left_index=True, right_index=True, how='outer')
+                print(f"Combined {len(dataframes)} dataframes horizontally")
+        
+        print(f"Final combined DataFrame shape: {combined_df.shape}")
+        print(f"Final columns: {list(combined_df.columns)}")
         
         # Analyze with OpenAI
-        analysis_text = analyze_dataframe_with_openai(df, request.prompt)
+        analysis_text = analyze_dataframe_with_openai(combined_df, request.prompt)
         
         # Generate chart if relevant
-        chart_base64 = generate_chart_from_prompt(df, request.prompt, analysis_text)
+        chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text)
         
         # Create data summary
         data_summary = {
-            "rows": len(df),
-            "columns": len(df.columns),
-            "column_names": list(df.columns),
-            "numeric_columns": list(df.select_dtypes(include=['number']).columns),
-            "categorical_columns": list(df.select_dtypes(include=['object']).columns)
+            "rows": len(combined_df),
+            "columns": len(combined_df.columns),
+            "column_names": list(combined_df.columns),
+            "numeric_columns": list(combined_df.select_dtypes(include=['number']).columns),
+            "categorical_columns": list(combined_df.select_dtypes(include=['object']).columns),
+            "files_processed": len(request.fileAddresses)
         }
         
         # Return JSON response

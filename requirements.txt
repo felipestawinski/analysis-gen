@@ -9,3 +9,5 @@ httpx
 openai
 matplotlib
 python-dotenv
+requests
+seaborn

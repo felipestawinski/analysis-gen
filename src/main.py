@@ -12,6 +12,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import requests
 from typing import List
+import seaborn as sns
 
 # Load environment variables
 load_dotenv()
@@ -39,6 +40,27 @@ def detect_language(text: str) -> str:
     portuguese_count = sum(1 for word in portuguese_indicators if word in text_lower)
     
     return 'pt' if portuguese_count > 0 else 'en'
+
+def is_visualization_request(prompt: str) -> bool:
+    """
+    Detect if the user is asking for a visualization/chart/graph
+    """
+    visualization_keywords = [
+        # English
+        'visualize', 'visualization', 'chart', 'graph', 'plot', 'show me',
+        'display', 'draw', 'create a chart', 'create a graph', 'bar chart',
+        'line chart', 'pie chart', 'scatter plot', 'histogram', 'heatmap',
+        # Portuguese
+        'visualizar', 'visualização', 'gráfico', 'plotar', 'mostre',
+        'exibir', 'desenhar', 'criar gráfico', 'criar um gráfico',
+        'gráfico de barras', 'gráfico de linhas', 'gráfico de pizza',
+        'dispersão', 'histograma', 'mapa de calor',
+        # Spanish
+        'visualizar', 'visualización', 'gráfica', 'mostrar', 'dibujar'
+    ]
+    
+    prompt_lower = prompt.lower()
+    return any(keyword in prompt_lower for keyword in visualization_keywords)
 
 def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str) -> str:
     """
@@ -232,59 +254,303 @@ def analyze_dataframe_fallback(df: pd.DataFrame, user_prompt: str) -> str:
     else:
         return "\n".join(analysis) if analysis else "Unable to analyze the data for this specific question."
 
-def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str) -> str:
+def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str) -> str:
     """
-    Generate a chart based on the prompt and analysis response
+    Use AI to generate Python code for visualization based on user prompt
+    Returns only the Python code as a string
+    """
+    # Create a summary of the dataframe
+    df_summary = {
+        "shape": df.shape,
+        "columns": list(df.columns),
+        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "sample_data": df.head(3).to_dict(),
+        "numeric_columns": list(df.select_dtypes(include=['number']).columns),
+        "categorical_columns": list(df.select_dtypes(include=['object', 'category']).columns)
+    }
+    
+    system_prompt = """You are a Python data visualization expert. Generate ONLY executable Python code to create a visualization based on the user's request.
+
+IMPORTANT RULES:
+1. Return ONLY Python code, no explanations, no markdown, no comments except necessary ones
+2. The DataFrame is already loaded as 'df' - do NOT reload it
+3. Use matplotlib and/or seaborn for visualizations
+4. The code must save the figure to 'output_chart.png' using plt.savefig('output_chart.png', dpi=150, bbox_inches='tight')
+5. Always include plt.close() at the end
+6. Use proper labels, titles, and formatting
+7. Handle any potential errors (missing data, etc.)
+8. Make the visualization clear and professional
+9. If the user's language is Portuguese, use Portuguese labels; if English, use English labels
+
+Example output format:
+```python
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.figure(figsize=(12, 7))
+# Your visualization code here
+plt.title('Chart Title')
+plt.xlabel('X Label')
+plt.ylabel('Y Label')
+plt.tight_layout()
+plt.savefig('output_chart.png', dpi=150, bbox_inches='tight')
+plt.close()
+```"""
+    
+    user_message = f"""
+Dataset Information:
+- Shape: {df_summary['shape']} (rows, columns)
+- Columns: {df_summary['columns']}
+- Data types: {df_summary['dtypes']}
+- Numeric columns: {df_summary['numeric_columns']}
+- Categorical columns: {df_summary['categorical_columns']}
+- Sample data (first 3 rows): {df_summary['sample_data']}
+
+User Request: {user_prompt}
+
+Generate Python code to create the visualization. Remember: the DataFrame is already available as 'df'.
+"""
+    
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                max_tokens=1500,
+                temperature=0.1
+            )
+            code = response.choices[0].message.content
+            
+            # Clean up the code - remove markdown code blocks if present
+            if "```python" in code:
+                code = code.split("```python")[1].split("```")[0]
+            elif "```" in code:
+                code = code.split("```")[1].split("```")[0]
+            
+            return code.strip()
+        except Exception as e:
+            print(f"Error generating visualization code with AI: {str(e)}")
+            return None
+    else:
+        print("No OpenAI API key found")
+        return None
+
+def execute_visualization_code(df: pd.DataFrame, code: str, output_path: str = "output_chart.png") -> bool:
+    """
+    Execute the AI-generated visualization code safely
+    Returns True if successful, False otherwise
     """
     try:
-        plt.figure(figsize=(10, 6))
+        # Create a safe execution environment with necessary imports
+        exec_globals = {
+            'df': df,
+            'pd': pd,
+            'plt': plt,
+            'sns': sns,
+            'np': __import__('numpy'),
+            'io': io,
+            'base64': base64
+        }
         
-        # Simple logic to determine chart type based on prompt keywords
+        # Execute the code
+        exec(code, exec_globals)
+        
+        # Check if the output file was created
+        if os.path.exists(output_path):
+            return True
+        else:
+            print(f"Visualization code executed but {output_path} was not created")
+            return False
+            
+    except Exception as e:
+        print(f"Error executing visualization code: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str = "") -> str:
+    """
+    Generate a chart based on the prompt using AI-generated code
+    Falls back to rule-based generation if AI fails
+    """
+    # First, try AI-generated visualization
+    print("Attempting AI-generated visualization...")
+    viz_code = generate_visualization_code_with_ai(df, prompt)
+    
+    if viz_code:
+        print("Generated visualization code:")
+        print(viz_code)
+        print("-" * 50)
+        
+        output_path = "output_chart.png"
+        
+        # Clean up any existing output file
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        
+        # Execute the generated code
+        if execute_visualization_code(df, viz_code, output_path):
+            try:
+                # Read the generated image and convert to base64
+                with open(output_path, 'rb') as img_file:
+                    chart_base64 = base64.b64encode(img_file.read()).decode()
+                
+                # Clean up the file
+                os.remove(output_path)
+                
+                print("AI-generated visualization successful!")
+                return chart_base64
+            except Exception as e:
+                print(f"Error reading generated chart: {str(e)}")
+    
+    # Fallback to rule-based visualization
+    print("Falling back to rule-based visualization...")
+    return generate_chart_fallback(df, prompt, analysis_response)
+
+def generate_chart_fallback(df: pd.DataFrame, prompt: str, analysis_response: str = "") -> str:
+    """
+    Fallback chart generation using rule-based approach
+    This is the original generate_chart_from_prompt logic
+    """
+    try:
+        # Set style for better looking charts
+        plt.style.use('seaborn-v0_8-darkgrid')
+        fig, ax = plt.subplots(figsize=(12, 7))
+        
         prompt_lower = prompt.lower()
-        analysis_lower = analysis_response.lower()
+        lang = detect_language(prompt)
         
-        if any(word in prompt_lower for word in ['top', 'scorer', 'highest', 'best', 'most']):
-            # Look for numeric columns to create bar charts
-            numeric_cols = df.select_dtypes(include=['number']).columns
+        # Detect chart type requested
+        chart_type = None
+        if any(word in prompt_lower for word in ['bar chart', 'bar graph', 'barra', 'barras']):
+            chart_type = 'bar'
+        elif any(word in prompt_lower for word in ['line chart', 'line graph', 'linha', 'linhas', 'trend', 'tendência']):
+            chart_type = 'line'
+        elif any(word in prompt_lower for word in ['pie chart', 'pie graph', 'pizza', 'torta']):
+            chart_type = 'pie'
+        elif any(word in prompt_lower for word in ['scatter', 'dispersão', 'scatter plot']):
+            chart_type = 'scatter'
+        elif any(word in prompt_lower for word in ['histogram', 'histograma', 'distribution', 'distribuição']):
+            chart_type = 'histogram'
+        elif any(word in prompt_lower for word in ['heatmap', 'heat map', 'mapa de calor', 'correlação', 'correlation']):
+            chart_type = 'heatmap'
+        elif any(word in prompt_lower for word in ['box plot', 'boxplot', 'box', 'caixa']):
+            chart_type = 'box'
+        
+        numeric_cols = df.select_dtypes(include=['number']).columns
+        categorical_cols = df.select_dtypes(include=['object', 'category']).columns
+        
+        # Generate chart based on type or infer from data
+        if chart_type == 'heatmap' and len(numeric_cols) > 1:
+            plt.close()
+            fig, ax = plt.subplots(figsize=(10, 8))
+            correlation = df[numeric_cols].corr()
+            sns.heatmap(correlation, annot=True, fmt='.2f', cmap='coolwarm', ax=ax)
+            title = 'Correlation Heatmap' if lang == 'en' else 'Mapa de Correlação'
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            
+        elif chart_type == 'pie':
+            if len(categorical_cols) > 0:
+                col = categorical_cols[0]
+                data = df[col].value_counts().head(10)
+                ax.pie(data.values, labels=data.index, autopct='%1.1f%%', startangle=90)
+                ax.set_title(f'{col} Distribution', fontsize=14, fontweight='bold')
+            elif len(numeric_cols) > 0:
+                col = numeric_cols[0]
+                ax.pie(df[col].head(10), labels=df.index[:10], autopct='%1.1f%%')
+                ax.set_title(f'{col} Distribution', fontsize=14, fontweight='bold')
+                
+        elif chart_type == 'histogram':
             if len(numeric_cols) > 0:
-                # Try to find relevant column based on prompt
+                col = numeric_cols[0]
+                ax.hist(df[col].dropna(), bins=30, edgecolor='black', alpha=0.7)
+                ax.set_xlabel(col, fontsize=12)
+                ax.set_ylabel('Frequency' if lang == 'en' else 'Frequência', fontsize=12)
+                title = f'Distribution of {col}' if lang == 'en' else f'Distribuição de {col}'
+                ax.set_title(title, fontsize=14, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                
+        elif chart_type == 'scatter':
+            if len(numeric_cols) >= 2:
+                x_col, y_col = numeric_cols[0], numeric_cols[1]
+                ax.scatter(df[x_col], df[y_col], alpha=0.6, s=50)
+                ax.set_xlabel(x_col, fontsize=12)
+                ax.set_ylabel(y_col, fontsize=12)
+                ax.set_title(f'{y_col} vs {x_col}', fontsize=14, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                
+        elif chart_type == 'box':
+            if len(numeric_cols) > 0:
+                df[numeric_cols[:5]].boxplot(ax=ax)
+                ax.set_ylabel('Value' if lang == 'en' else 'Valor', fontsize=12)
+                ax.set_title('Box Plot', fontsize=14, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                
+        elif chart_type == 'line':
+            if len(numeric_cols) > 0:
+                col = numeric_cols[0]
+                df[col].plot(kind='line', ax=ax, linewidth=2, marker='o')
+                ax.set_ylabel(col, fontsize=12)
+                ax.set_xlabel('Index' if lang == 'en' else 'Índice', fontsize=12)
+                title = f'{col} Trend' if lang == 'en' else f'Tendência de {col}'
+                ax.set_title(title, fontsize=14, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                
+        elif any(word in prompt_lower for word in ['top', 'scorer', 'highest', 'best', 'most', 'maior', 'melhor', 'artilheiro']):
+            if len(numeric_cols) > 0:
                 target_col = None
                 for col in df.columns:
-                    if any(word in col.lower() for word in ['goal', 'score', 'point']):
+                    if any(word in col.lower() for word in ['goal', 'score', 'point', 'gol', 'ponto', 'valor', 'value']):
                         target_col = col
                         break
                 
-                if target_col and target_col in numeric_cols:
-                    # Group by player/name column if exists, otherwise use index
-                    name_cols = [col for col in df.columns if any(word in col.lower() for word in ['name', 'player', 'team'])]
-                    if name_cols:
-                        top_data = df.nlargest(10, target_col)
-                        plt.bar(range(len(top_data)), top_data[target_col])
-                        plt.xticks(range(len(top_data)), top_data[name_cols[0]], rotation=45)
-                        plt.ylabel(target_col)
-                        plt.title(f'Top 10 {target_col}')
-                    else:
-                        top_data = df[target_col].nlargest(10)
-                        plt.bar(range(len(top_data)), top_data.values)
-                        plt.ylabel(target_col)
-                        plt.title(f'Top 10 {target_col}')
-        
-        elif any(word in prompt_lower for word in ['distribution', 'histogram', 'spread']):
-            numeric_cols = df.select_dtypes(include=['number']).columns
-            if len(numeric_cols) > 0:
-                df[numeric_cols[0]].hist(bins=20)
-                plt.xlabel(numeric_cols[0])
-                plt.ylabel('Frequency')
-                plt.title(f'Distribution of {numeric_cols[0]}')
-        
+                if not target_col:
+                    target_col = numeric_cols[0]
+                
+                name_cols = [c for c in df.columns if any(word in c.lower() for word in ['name', 'player', 'team', 'nome', 'jogador', 'time', 'equipe'])]
+                
+                if name_cols:
+                    top_data = df.nlargest(15, target_col)
+                    bars = ax.barh(range(len(top_data)), top_data[target_col])
+                    ax.set_yticks(range(len(top_data)))
+                    ax.set_yticklabels(top_data[name_cols[0]], fontsize=10)
+                    ax.set_xlabel(target_col, fontsize=12)
+                    title = f'Top 15 by {target_col}' if lang == 'en' else f'Top 15 por {target_col}'
+                    ax.set_title(title, fontsize=14, fontweight='bold')
+                    ax.invert_yaxis()
+                    
+                    for i, (idx, bar) in enumerate(zip(top_data.index, bars)):
+                        width = bar.get_width()
+                        ax.text(width, bar.get_y() + bar.get_height()/2, 
+                               f'{width:.1f}', ha='left', va='center', fontsize=9)
+                else:
+                    top_data = df.nlargest(15, target_col)
+                    ax.bar(range(len(top_data)), top_data[target_col])
+                    ax.set_xlabel('Rank' if lang == 'en' else 'Posição', fontsize=12)
+                    ax.set_ylabel(target_col, fontsize=12)
+                    title = f'Top 15 {target_col}' if lang == 'en' else f'Top 15 {target_col}'
+                    ax.set_title(title, fontsize=14, fontweight='bold')
+                    
         else:
-            # Default: create a simple chart with first numeric column
-            numeric_cols = df.select_dtypes(include=['number']).columns
-            if len(numeric_cols) > 0:
-                df[numeric_cols[0]].value_counts().head(10).plot(kind='bar')
-                plt.xlabel(numeric_cols[0])
-                plt.ylabel('Count')
-                plt.title(f'{numeric_cols[0]} Distribution')
+            if len(numeric_cols) > 0 and len(categorical_cols) > 0:
+                cat_col = categorical_cols[0]
+                num_col = numeric_cols[0]
+                grouped = df.groupby(cat_col)[num_col].mean().nlargest(15)
+                grouped.plot(kind='barh', ax=ax)
+                ax.set_xlabel(num_col, fontsize=12)
+                ax.set_ylabel(cat_col, fontsize=12)
+                title = f'Average {num_col} by {cat_col}' if lang == 'en' else f'Média de {num_col} por {cat_col}'
+                ax.set_title(title, fontsize=14, fontweight='bold')
+            elif len(numeric_cols) > 0:
+                col = numeric_cols[0]
+                df[col].head(20).plot(kind='bar', ax=ax)
+                ax.set_ylabel(col, fontsize=12)
+                ax.set_xlabel('Index' if lang == 'en' else 'Índice', fontsize=12)
+                ax.set_title(f'{col} Values', fontsize=14, fontweight='bold')
+                ax.tick_params(axis='x', rotation=45)
         
         plt.tight_layout()
         
@@ -293,12 +559,13 @@ def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response:
         plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
         img_buffer.seek(0)
         chart_base64 = base64.b64encode(img_buffer.getvalue()).decode()
-        plt.close()
+        plt.close('all')
         
         return chart_base64
         
     except Exception as e:
-        print(f"Error generating chart: {str(e)}")
+        print(f"Error generating fallback chart: {str(e)}")
+        plt.close('all')
         return None
 
 @app.post("/analysis-gen")
@@ -306,6 +573,10 @@ async def download_csv(request: URLRequest):
     try:
         print(f"User prompt: {request.prompt}")
         print(f"Number of files to process: {len(request.fileAddresses)}")
+        
+        # Check if this is a visualization request
+        is_viz_request = is_visualization_request(request.prompt)
+        print(f"Visualization request detected: {is_viz_request}")
         
         # Download and parse all CSV files
         dataframes = []
@@ -340,11 +611,24 @@ async def download_csv(request: URLRequest):
         print(f"Final combined DataFrame shape: {combined_df.shape}")
         print(f"Final columns: {list(combined_df.columns)}")
         
-        # Analyze with OpenAI
+        # Analyze with OpenAI (or fallback)
         analysis_text = analyze_dataframe_with_openai(combined_df, request.prompt)
         
-        # Generate chart if relevant
-        chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text)
+        # Generate chart if it's a visualization request OR if the prompt suggests graphical analysis
+        chart_base64 = None
+        if is_viz_request:
+            print("Generating chart for visualization request...")
+            chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text)
+        else:
+            # Also try to generate chart for common analytical questions even if not explicitly asking for viz
+            prompt_lower = request.prompt.lower()
+            should_auto_chart = any(word in prompt_lower for word in [
+                'top', 'best', 'highest', 'most', 'compare', 'comparison',
+                'maior', 'melhor', 'artilheiro', 'comparar', 'comparação'
+            ])
+            if should_auto_chart:
+                print("Generating chart for analytical query...")
+                chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text)
         
         # Create data summary
         data_summary = {
@@ -353,7 +637,8 @@ async def download_csv(request: URLRequest):
             "column_names": list(combined_df.columns),
             "numeric_columns": list(combined_df.select_dtypes(include=['number']).columns),
             "categorical_columns": list(combined_df.select_dtypes(include=['object']).columns),
-            "files_processed": len(request.fileAddresses)
+            "files_processed": len(request.fileAddresses),
+            "visualization_generated": chart_base64 is not None
         }
         
         # Return JSON response

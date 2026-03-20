@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 import uvicorn
 import httpx
@@ -137,6 +137,71 @@ async def data_health_check(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="The file could not be decoded as UTF-8.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error analysing file: {str(e)}")
+
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean a DataFrame by:
+    1. Dropping fully-duplicate rows
+    2. Dropping columns that are 100% null
+    3. Filling numeric nulls with column median
+    4. Filling categorical nulls with column mode
+    5. Stripping leading/trailing whitespace from string columns
+    """
+    # 1. Drop duplicate rows
+    df = df.drop_duplicates()
+
+    # 2. Drop columns that are entirely null
+    df = df.dropna(axis=1, how="all")
+
+    # 3 & 4. Fill missing values
+    for col in df.columns:
+        if df[col].isnull().any():
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(df[col].median())
+            else:
+                mode_val = df[col].mode()
+                if not mode_val.empty:
+                    df[col] = df[col].fillna(mode_val.iloc[0])
+
+    # 5. Strip whitespace from string columns
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].str.strip()
+
+    return df
+
+
+@app.post("/data-health-check-clean")
+async def data_health_check_clean(file: UploadFile = File(...)):
+    """
+    Receive a CSV file, clean it (drop duplicates, fill nulls, etc.),
+    and return the cleaned CSV as a downloadable file.
+    Called by the Go backend when the user chooses to upload the cleaned file.
+    """
+    try:
+        contents = await file.read()
+        csv_text = contents.decode("utf-8")
+        df = pd.read_csv(io.StringIO(csv_text))
+
+        cleaned_df = clean_dataframe(df)
+
+        # Convert cleaned DataFrame back to CSV
+        output = io.StringIO()
+        cleaned_df.to_csv(output, index=False)
+        output.seek(0)
+
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=cleaned_{file.filename}"},
+        )
+
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty or not a valid CSV.")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="The file could not be decoded as UTF-8.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error cleaning file: {str(e)}")
 
 
 def detect_language(text: str) -> str:

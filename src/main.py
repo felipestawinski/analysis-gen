@@ -26,6 +26,8 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 class URLRequest(BaseModel):
     fileAddresses: List[HttpUrl]
     prompt: str
+    generateChart: bool = False
+    chartRecommendation: bool = False
 
 
 def perform_data_health_check(df: pd.DataFrame) -> str:
@@ -746,15 +748,151 @@ def generate_chart_fallback(df: pd.DataFrame, prompt: str, analysis_response: st
         plt.close('all')
         return None
 
+def recommend_chart_type(df: pd.DataFrame) -> str:
+    """
+    Analyze the DataFrame structure and recommend the best chart types.
+    Works without any external API — uses data shape heuristics.
+    """
+    numeric_cols = list(df.select_dtypes(include=['number']).columns)
+    categorical_cols = list(df.select_dtypes(include=['object', 'category']).columns)
+    total_rows = len(df)
+    num_numeric = len(numeric_cols)
+    num_categorical = len(categorical_cols)
+
+    recommendations = []
+    recommendations.append("## 📊 Recomendação de Gráficos\n")
+    recommendations.append(f"**Resumo dos dados:** {total_rows} linhas, {num_numeric} colunas numéricas, {num_categorical} colunas categóricas.\n")
+    recommendations.append(f"**Colunas numéricas:** {', '.join(numeric_cols) if numeric_cols else 'Nenhuma'}")
+    recommendations.append(f"**Colunas categóricas:** {', '.join(categorical_cols) if categorical_cols else 'Nenhuma'}\n")
+    recommendations.append("### Gráficos recomendados:\n")
+
+    rank = 1
+
+    # Bar chart: categorical + numeric
+    if num_categorical > 0 and num_numeric > 0:
+        cat = categorical_cols[0]
+        num = numeric_cols[0]
+        recommendations.append(f"**{rank}. Gráfico de Barras** 📊")
+        recommendations.append(f"   - Ideal para comparar `{num}` entre diferentes `{cat}`.")
+        recommendations.append(f"   - Exemplo: \"Gere um gráfico de barras de {num} por {cat}\"\n")
+        rank += 1
+
+    # Scatter plot: 2+ numeric
+    if num_numeric >= 2:
+        x, y = numeric_cols[0], numeric_cols[1]
+        recommendations.append(f"**{rank}. Gráfico de Dispersão (Scatter Plot)** 🔵")
+        recommendations.append(f"   - Ideal para ver a correlação entre `{x}` e `{y}`.")
+        recommendations.append(f"   - Exemplo: \"Gere um scatter plot de {y} vs {x}\"\n")
+        rank += 1
+
+    # Histogram: numeric data
+    if num_numeric > 0:
+        col = numeric_cols[0]
+        recommendations.append(f"**{rank}. Histograma** 📈")
+        recommendations.append(f"   - Ideal para ver a distribuição de `{col}`.")
+        recommendations.append(f"   - Exemplo: \"Gere um histograma de {col}\"\n")
+        rank += 1
+
+    # Heatmap: 3+ numeric (correlation)
+    if num_numeric >= 3:
+        recommendations.append(f"**{rank}. Mapa de Calor (Heatmap)** 🟥")
+        recommendations.append(f"   - Ideal para ver a correlação entre todas as variáveis numéricas.")
+        recommendations.append(f"   - Exemplo: \"Gere um mapa de calor de correlação\"\n")
+        rank += 1
+
+    # Pie chart: categorical with few categories
+    if num_categorical > 0:
+        cat = categorical_cols[0]
+        unique_count = df[cat].nunique()
+        if unique_count <= 10:
+            recommendations.append(f"**{rank}. Gráfico de Pizza** 🥧")
+            recommendations.append(f"   - Ideal para ver a proporção de `{cat}` ({unique_count} categorias).")
+            recommendations.append(f"   - Exemplo: \"Gere um gráfico de pizza de {cat}\"\n")
+            rank += 1
+
+    # Line chart: if data looks sequential
+    if num_numeric > 0 and total_rows > 5:
+        col = numeric_cols[0]
+        recommendations.append(f"**{rank}. Gráfico de Linhas** 📉")
+        recommendations.append(f"   - Ideal para ver tendências de `{col}` ao longo do tempo.")
+        recommendations.append(f"   - Exemplo: \"Gere um gráfico de linhas de {col}\"\n")
+        rank += 1
+
+    # Box plot: numeric data
+    if num_numeric > 0:
+        recommendations.append(f"**{rank}. Box Plot** 📦")
+        recommendations.append(f"   - Ideal para ver a distribuição e outliers das colunas numéricas.")
+        recommendations.append(f"   - Exemplo: \"Gere um box plot das colunas numéricas\"\n")
+        rank += 1
+
+    recommendations.append("---")
+    recommendations.append("💡 **Dica:** Use o botão **Gerar Gráfico** para criar qualquer uma dessas visualizações. Basta digitar o que deseja e clicar no botão verde.")
+
+    return "\n".join(recommendations)
+
+
+def recommend_chart_type_with_ai(df: pd.DataFrame) -> str:
+    """
+    Use OpenAI to provide intelligent chart recommendations. Falls back to heuristic version.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        return recommend_chart_type(df)
+
+    df_summary = {
+        "shape": df.shape,
+        "columns": list(df.columns),
+        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "numeric_columns": list(df.select_dtypes(include=['number']).columns),
+        "categorical_columns": list(df.select_dtypes(include=['object', 'category']).columns),
+        "sample_data": df.head(3).to_dict(),
+        "basic_stats": df.describe().to_dict() if len(df.select_dtypes(include='number').columns) > 0 else None
+    }
+
+    system_prompt = """You are a data visualization expert. The user wants to know which chart types are best suited to visualize their dataset.
+
+IMPORTANT RULES:
+1. Always respond in Portuguese (pt-BR).
+2. Recommend 3-5 chart types ranked from most to least suitable.
+3. For each chart, explain WHY it's suitable for this specific data.
+4. Reference actual column names from the dataset in your examples.
+5. End with a tip telling the user to use the "Gerar Gráfico" button (green button) to create the visualization.
+6. Format the response nicely with markdown, emojis, and clear structure.
+7. DO NOT generate any code or chart — only recommend and explain."""
+
+    user_message = f"""Analyze this dataset and recommend the best chart types to visualize it:
+
+- Shape: {df_summary['shape']} (rows, columns)
+- Columns: {df_summary['columns']}
+- Data types: {df_summary['dtypes']}
+- Numeric columns: {df_summary['numeric_columns']}
+- Categorical columns: {df_summary['categorical_columns']}
+- Sample data: {df_summary['sample_data']}
+- Basic statistics: {df_summary['basic_stats']}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=1500,
+            temperature=0.3
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"OpenAI chart recommendation failed: {str(e)}")
+        return recommend_chart_type(df)
+
+
 @app.post("/analysis-gen")
 async def download_csv(request: URLRequest):
     try:
         print(f"User prompt: {request.prompt}")
         print(f"Number of files to process: {len(request.fileAddresses)}")
-        
-        # Check if this is a visualization request
-        is_viz_request = is_visualization_request(request.prompt)
-        print(f"Visualization request detected: {is_viz_request}")
+        print(f"Generate chart requested: {request.generateChart}")
+        print(f"Chart recommendation requested: {request.chartRecommendation}")
         
         # Download and parse all CSV files
         dataframes = []
@@ -789,24 +927,19 @@ async def download_csv(request: URLRequest):
         print(f"Final combined DataFrame shape: {combined_df.shape}")
         print(f"Final columns: {list(combined_df.columns)}")
         
-        # Analyze with OpenAI (or fallback)
-        analysis_text = analyze_dataframe_with_openai(combined_df, request.prompt)
-        
-        # Generate chart if it's a visualization request OR if the prompt suggests graphical analysis
-        chart_base64 = None
-        if is_viz_request:
-            print("Generating chart for visualization request...")
-            chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text)
+        # Route to chart recommendation or regular analysis
+        if request.chartRecommendation:
+            print("Generating chart recommendation...")
+            analysis_text = recommend_chart_type_with_ai(combined_df)
         else:
-            # Also try to generate chart for common analytical questions even if not explicitly asking for viz
-            prompt_lower = request.prompt.lower()
-            should_auto_chart = any(word in prompt_lower for word in [
-                'top', 'best', 'highest', 'most', 'compare', 'comparison',
-                'maior', 'melhor', 'artilheiro', 'comparar', 'comparação'
-            ])
-            if should_auto_chart:
-                print("Generating chart for analytical query...")
-                chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text)
+            # Analyze with OpenAI (or fallback)
+            analysis_text = analyze_dataframe_with_openai(combined_df, request.prompt)
+        
+        # Only generate chart when explicitly requested by the user via the "Gerar Gráfico" button
+        chart_base64 = None
+        if request.generateChart:
+            print("Generating chart (explicit request)...")
+            chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text)
         
         # Create data summary
         data_summary = {

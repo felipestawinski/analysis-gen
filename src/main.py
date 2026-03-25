@@ -28,6 +28,7 @@ class URLRequest(BaseModel):
     prompt: str
     generateChart: bool = False
     chartRecommendation: bool = False
+    model: str = "gpt-5-mini"
 
 
 def perform_data_health_check(df: pd.DataFrame) -> str:
@@ -242,7 +243,7 @@ def is_visualization_request(prompt: str) -> bool:
     prompt_lower = prompt.lower()
     return any(keyword in prompt_lower for keyword in visualization_keywords)
 
-def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str) -> str:
+def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str, model: str = "gpt-5-mini") -> str:
     """
     Send dataframe info and user prompt to OpenAI for analysis with fallback options
     """
@@ -276,7 +277,7 @@ def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str) -> str:
     if os.getenv("OPENAI_API_KEY"):
         try:
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
@@ -434,7 +435,7 @@ def analyze_dataframe_fallback(df: pd.DataFrame, user_prompt: str) -> str:
     else:
         return "\n".join(analysis) if analysis else "Unable to analyze the data for this specific question."
 
-def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str) -> str:
+def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str, model: str = "gpt-5-mini") -> str:
     """
     Use AI to generate Python code for visualization based on user prompt
     Returns only the Python code as a string
@@ -494,7 +495,7 @@ Generate Python code to create the visualization. Remember: the DataFrame is alr
     if os.getenv("OPENAI_API_KEY"):
         try:
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
@@ -551,14 +552,14 @@ def execute_visualization_code(df: pd.DataFrame, code: str, output_path: str = "
         traceback.print_exc()
         return False
 
-def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str = "") -> str:
+def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str = "", model: str = "gpt-5-mini") -> str:
     """
     Generate a chart based on the prompt using AI-generated code
     Falls back to rule-based generation if AI fails
     """
     # First, try AI-generated visualization
     print("Attempting AI-generated visualization...")
-    viz_code = generate_visualization_code_with_ai(df, prompt)
+    viz_code = generate_visualization_code_with_ai(df, prompt, model)
     
     if viz_code:
         print("Generated visualization code:")
@@ -831,7 +832,7 @@ def recommend_chart_type(df: pd.DataFrame) -> str:
     return "\n".join(recommendations)
 
 
-def recommend_chart_type_with_ai(df: pd.DataFrame) -> str:
+def recommend_chart_type_with_ai(df: pd.DataFrame, model: str = "gpt-5-mini") -> str:
     """
     Use OpenAI to provide intelligent chart recommendations. Falls back to heuristic version.
     """
@@ -872,7 +873,7 @@ IMPORTANT RULES:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
@@ -930,16 +931,16 @@ async def download_csv(request: URLRequest):
         # Route to chart recommendation or regular analysis
         if request.chartRecommendation:
             print("Generating chart recommendation...")
-            analysis_text = recommend_chart_type_with_ai(combined_df)
+            analysis_text = recommend_chart_type_with_ai(combined_df, request.model)
         else:
             # Analyze with OpenAI (or fallback)
-            analysis_text = analyze_dataframe_with_openai(combined_df, request.prompt)
+            analysis_text = analyze_dataframe_with_openai(combined_df, request.prompt, request.model)
         
         # Only generate chart when explicitly requested by the user via the "Gerar Gráfico" button
         chart_base64 = None
         if request.generateChart:
             print("Generating chart (explicit request)...")
-            chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text)
+            chart_base64 = generate_chart_from_prompt(combined_df, request.prompt, analysis_text, request.model)
         
         # Create data summary
         data_summary = {

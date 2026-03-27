@@ -274,6 +274,7 @@ def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str, model: str
     """
     
     # Try OpenAI first
+    FALLBACK_MODEL = "gpt-4o"
     if os.getenv("OPENAI_API_KEY"):
         try:
             response = client.chat.completions.create(
@@ -282,12 +283,28 @@ def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str, model: str
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
-                max_tokens=2000,
-                temperature=0.3
+                max_completion_tokens=2000
             )
+            print("using model", model)
             return response.choices[0].message.content
         except Exception as e:
-            print(f"OpenAI failed: {str(e)}")
+            print(f"OpenAI failed with model '{model}': {str(e)}")
+            # Retry with fallback model if the selected model is not available
+            if model != FALLBACK_MODEL:
+                try:
+                    print(f"Retrying with fallback model '{FALLBACK_MODEL}'...")
+                    response = client.chat.completions.create(
+                        model=FALLBACK_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_message}
+                        ],
+                        max_completion_tokens=2000
+                    )
+                    print(f"using fallback model {FALLBACK_MODEL}")
+                    return response.choices[0].message.content
+                except Exception as e2:
+                    print(f"Fallback model also failed: {str(e2)}")
             # Fall through to alternatives
     
     # Try Hugging Face as backup
@@ -492,6 +509,7 @@ User Request: {user_prompt}
 Generate Python code to create the visualization. Remember: the DataFrame is already available as 'df'.
 """
     
+    FALLBACK_MODEL = "gpt-4o"
     if os.getenv("OPENAI_API_KEY"):
         try:
             response = client.chat.completions.create(
@@ -500,8 +518,7 @@ Generate Python code to create the visualization. Remember: the DataFrame is alr
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
-                max_tokens=1500,
-                temperature=0.1
+                max_completion_tokens=1500
             )
             code = response.choices[0].message.content
             
@@ -513,7 +530,27 @@ Generate Python code to create the visualization. Remember: the DataFrame is alr
             
             return code.strip()
         except Exception as e:
-            print(f"Error generating visualization code with AI: {str(e)}")
+            print(f"Error generating visualization code with model '{model}': {str(e)}")
+            # Retry with fallback model
+            if model != FALLBACK_MODEL:
+                try:
+                    print(f"Retrying visualization with fallback model '{FALLBACK_MODEL}'...")
+                    response = client.chat.completions.create(
+                        model=FALLBACK_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_message}
+                        ],
+                        max_completion_tokens=1500
+                    )
+                    code = response.choices[0].message.content
+                    if "```python" in code:
+                        code = code.split("```python")[1].split("```")[0]
+                    elif "```" in code:
+                        code = code.split("```")[1].split("```")[0]
+                    return code.strip()
+                except Exception as e2:
+                    print(f"Fallback model also failed for visualization: {str(e2)}")
             return None
     else:
         print("No OpenAI API key found")
@@ -878,8 +915,7 @@ IMPORTANT RULES:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
             ],
-            max_tokens=1500,
-            temperature=0.3
+            max_completion_tokens=1500
         )
         return response.choices[0].message.content
     except Exception as e:

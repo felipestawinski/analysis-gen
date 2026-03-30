@@ -12,8 +12,12 @@ import os
 from openai import OpenAI
 from dotenv import load_dotenv
 import requests
-from typing import List
+from typing import List, Optional
 import seaborn as sns
+import time
+import threading
+from collections import OrderedDict
+from normalization import detect_file_type, dataframe_from_bytes, dataframe_preview
 
 # Load environment variables
 load_dotenv()
@@ -25,10 +29,127 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class URLRequest(BaseModel):
     fileAddresses: List[HttpUrl]
+    fileTypes: Optional[List[str]] = None
     prompt: str
     generateChart: bool = False
     chartRecommendation: bool = False
+    chatId: Optional[str] = None
+    forceRefresh: bool = False
     model: str = "gpt-5-mini"
+
+
+class PreviewRequest(BaseModel):
+    fileAddress: HttpUrl
+    fileType: Optional[str] = None
+    maxRows: int = 20
+    maxCols: int = 12
+    forceRefresh: bool = False
+
+
+CSV_CACHE_TTL_SECONDS = int(os.getenv("CSV_CACHE_TTL_SECONDS", "1800"))
+CSV_CACHE_MAX_BYTES = int(os.getenv("CSV_CACHE_MAX_BYTES", str(200 * 1024 * 1024)))
+CSV_CACHE_MAX_ENTRIES = int(os.getenv("CSV_CACHE_MAX_ENTRIES", "128"))
+
+csv_cache: OrderedDict[str, dict] = OrderedDict()
+csv_cache_total_bytes = 0
+csv_cache_lock = threading.RLock()
+
+
+def _evict_expired_entries_locked(now_ts: float):
+    global csv_cache_total_bytes
+    keys_to_remove = []
+    for key, entry in csv_cache.items():
+        if now_ts - entry["cached_at"] > CSV_CACHE_TTL_SECONDS:
+            keys_to_remove.append(key)
+
+    for key in keys_to_remove:
+        removed = csv_cache.pop(key, None)
+        if removed:
+            csv_cache_total_bytes -= removed["size_bytes"]
+            print(f"CSV cache expired: {key}")
+
+
+def _evict_to_limits_locked():
+    global csv_cache_total_bytes
+    while (
+        len(csv_cache) > CSV_CACHE_MAX_ENTRIES
+        or csv_cache_total_bytes > CSV_CACHE_MAX_BYTES
+    ):
+        evicted_key, evicted_entry = csv_cache.popitem(last=False)
+        csv_cache_total_bytes -= evicted_entry["size_bytes"]
+        print(f"CSV cache evicted (LRU): {evicted_key}")
+
+
+def get_cached_csv_text(cache_key: str) -> Optional[str]:
+    now_ts = time.time()
+    with csv_cache_lock:
+        _evict_expired_entries_locked(now_ts)
+        entry = csv_cache.get(cache_key)
+        if not entry:
+            return None
+
+        csv_cache.move_to_end(cache_key)
+        print(f"CSV cache hit: {cache_key}")
+        return entry["csv_text"]
+
+
+def set_cached_csv_text(cache_key: str, csv_text: str):
+    global csv_cache_total_bytes
+    text_size = len(csv_text.encode("utf-8"))
+    if text_size > CSV_CACHE_MAX_BYTES:
+        print(f"CSV cache skip (entry too large): {cache_key}")
+        return
+
+    now_ts = time.time()
+    with csv_cache_lock:
+        existing = csv_cache.pop(cache_key, None)
+        if existing:
+            csv_cache_total_bytes -= existing["size_bytes"]
+
+        csv_cache[cache_key] = {
+            "csv_text": csv_text,
+            "cached_at": now_ts,
+            "size_bytes": text_size,
+        }
+        print(f"CSV cached: {cache_key} ({text_size} bytes)")
+        csv_cache_total_bytes += text_size
+        csv_cache.move_to_end(cache_key)
+        _evict_expired_entries_locked(now_ts)
+        _evict_to_limits_locked()
+
+
+async def get_or_download_csv_text(client_http: httpx.AsyncClient, file_address: str, force_refresh: bool = False) -> str:
+    cache_key = file_address.strip()
+    if not force_refresh:
+        cached_csv = get_cached_csv_text(cache_key)
+        if cached_csv is not None:
+            return cached_csv
+        print(f"CSV cache miss: {cache_key}")
+        print(f"Downloading CSV for first-time use: {cache_key}")
+    else:
+        print(f"CSV cache bypassed (forceRefresh=true): {cache_key}")
+        print(f"Downloading CSV with forced refresh: {cache_key}")
+
+    response = await client_http.get(cache_key)
+    response.raise_for_status()
+    csv_text = response.text
+    set_cached_csv_text(cache_key, csv_text)
+    return csv_text
+
+
+async def get_or_download_file_bytes(
+    client_http: httpx.AsyncClient,
+    file_address: str,
+    file_type: str,
+    force_refresh: bool = False,
+) -> bytes:
+    if file_type == "csv":
+        csv_text = await get_or_download_csv_text(client_http, file_address, force_refresh)
+        return csv_text.encode("utf-8")
+
+    response = await client_http.get(file_address)
+    response.raise_for_status()
+    return response.content
 
 
 def perform_data_health_check(df: pd.DataFrame) -> str:
@@ -128,14 +249,14 @@ async def data_health_check(file: UploadFile = File(...)):
     """
     try:
         contents = await file.read()
-        csv_text = contents.decode("utf-8")
-        df = pd.read_csv(io.StringIO(csv_text))
+        file_type = detect_file_type(filename=file.filename, content_type=file.content_type)
+        df = dataframe_from_bytes(contents, file_type)
 
         report = perform_data_health_check(df)
         return report
 
     except pd.errors.EmptyDataError:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty or not a valid CSV.")
+        raise HTTPException(status_code=400, detail="The uploaded file is empty or not a valid tabular file.")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="The file could not be decoded as UTF-8.")
     except Exception as e:
@@ -183,8 +304,8 @@ async def data_health_check_clean(file: UploadFile = File(...)):
     """
     try:
         contents = await file.read()
-        csv_text = contents.decode("utf-8")
-        df = pd.read_csv(io.StringIO(csv_text))
+        file_type = detect_file_type(filename=file.filename, content_type=file.content_type)
+        df = dataframe_from_bytes(contents, file_type)
 
         cleaned_df = clean_dataframe(df)
 
@@ -200,11 +321,37 @@ async def data_health_check_clean(file: UploadFile = File(...)):
         )
 
     except pd.errors.EmptyDataError:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty or not a valid CSV.")
+        raise HTTPException(status_code=400, detail="The uploaded file is empty or not a valid tabular file.")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="The file could not be decoded as UTF-8.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error cleaning file: {str(e)}")
+
+
+@app.post("/preview-gen")
+async def preview_gen(request: PreviewRequest):
+    try:
+        file_type = detect_file_type(explicit_type=request.fileType, filename=str(request.fileAddress))
+        async with httpx.AsyncClient() as client_http:
+            file_bytes = await get_or_download_file_bytes(
+                client_http,
+                str(request.fileAddress),
+                file_type,
+                request.forceRefresh,
+            )
+
+        df = dataframe_from_bytes(file_bytes, file_type)
+        headers, rows = dataframe_preview(df, request.maxRows, request.maxCols)
+
+        return {
+            "headers": headers,
+            "rows": rows,
+            "fileType": file_type,
+        }
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=400, detail=f"Error downloading file: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating preview: {str(e)}")
 
 
 def detect_language(text: str) -> str:
@@ -464,7 +611,7 @@ def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str, mode
         "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
         "sample_data": df.head(3).to_dict(),
         "numeric_columns": list(df.select_dtypes(include=['number']).columns),
-        "categorical_columns": list(df.select_dtypes(include=['object', 'category']).columns)
+        "categorical_columns": list(df.select_dtypes(include=['object', 'string', 'category']).columns)
     }
     
     system_prompt = """You are a Python data visualization expert. Generate ONLY executable Python code to create a visualization based on the user's request.
@@ -659,7 +806,7 @@ def generate_chart_fallback(df: pd.DataFrame, prompt: str, analysis_response: st
             chart_type = 'box'
         
         numeric_cols = df.select_dtypes(include=['number']).columns
-        categorical_cols = df.select_dtypes(include=['object', 'category']).columns
+        categorical_cols = df.select_dtypes(include=['object', 'string', 'category']).columns
         
         # Generate chart based on type or infer from data
         if chart_type == 'heatmap' and len(numeric_cols) > 1:
@@ -792,7 +939,7 @@ def recommend_chart_type(df: pd.DataFrame) -> str:
     Works without any external API — uses data shape heuristics.
     """
     numeric_cols = list(df.select_dtypes(include=['number']).columns)
-    categorical_cols = list(df.select_dtypes(include=['object', 'category']).columns)
+    categorical_cols = list(df.select_dtypes(include=['object', 'string', 'category']).columns)
     total_rows = len(df)
     num_numeric = len(numeric_cols)
     num_categorical = len(categorical_cols)
@@ -881,7 +1028,7 @@ def recommend_chart_type_with_ai(df: pd.DataFrame, model: str = "gpt-5-mini") ->
         "columns": list(df.columns),
         "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
         "numeric_columns": list(df.select_dtypes(include=['number']).columns),
-        "categorical_columns": list(df.select_dtypes(include=['object', 'category']).columns),
+        "categorical_columns": list(df.select_dtypes(include=['object', 'string', 'category']).columns),
         "sample_data": df.head(3).to_dict(),
         "basic_stats": df.describe().to_dict() if len(df.select_dtypes(include='number').columns) > 0 else None
     }
@@ -930,21 +1077,37 @@ async def download_csv(request: URLRequest):
         print(f"Number of files to process: {len(request.fileAddresses)}")
         print(f"Generate chart requested: {request.generateChart}")
         print(f"Chart recommendation requested: {request.chartRecommendation}")
+        print(f"Chat ID: {request.chatId}")
+        print(f"Force refresh: {request.forceRefresh}")
         
-        # Download and parse all CSV files
+        # Download and parse all tabular files
         dataframes = []
+        processed_file_types = []
         async with httpx.AsyncClient() as client_http:
             for idx, file_address in enumerate(request.fileAddresses):
-                print(f"Downloading file {idx + 1}/{len(request.fileAddresses)}: {file_address}")
-                response = await client_http.get(str(file_address))
-                response.raise_for_status()
-                
-                # Parse CSV
-                csv_content = response.text
-                df = pd.read_csv(io.StringIO(csv_content))
+                print(f"Processing file {idx + 1}/{len(request.fileAddresses)}: {file_address}")
+
+                incoming_file_type = (
+                    request.fileTypes[idx]
+                    if request.fileTypes and idx < len(request.fileTypes)
+                    else None
+                )
+                resolved_file_type = detect_file_type(
+                    explicit_type=incoming_file_type,
+                    filename=str(file_address),
+                )
+
+                file_content = await get_or_download_file_bytes(
+                    client_http,
+                    str(file_address),
+                    resolved_file_type,
+                    request.forceRefresh,
+                )
+                df = dataframe_from_bytes(file_content, resolved_file_type)
                 print(f"Loaded DataFrame {idx + 1} with shape: {df.shape}")
                 print(f"Columns: {list(df.columns)}")
                 dataframes.append(df)
+                processed_file_types.append(resolved_file_type)
         
         # Combine all dataframes into one
         if len(dataframes) == 1:
@@ -986,6 +1149,7 @@ async def download_csv(request: URLRequest):
             "numeric_columns": list(combined_df.select_dtypes(include=['number']).columns),
             "categorical_columns": list(combined_df.select_dtypes(include=['object']).columns),
             "files_processed": len(request.fileAddresses),
+            "file_types": processed_file_types,
             "visualization_generated": chart_base64 is not None
         }
         
@@ -1001,7 +1165,7 @@ async def download_csv(request: URLRequest):
         raise HTTPException(status_code=400, detail=f"Error downloading file: {str(e)}")
     except Exception as e:
         print(f"Error processing request: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=9090)

@@ -37,6 +37,57 @@ def detect_file_type(
     return "csv"
 
 
+def _try_convert_comma_decimals(df: pd.DataFrame) -> pd.DataFrame:
+    """Detect object columns with comma-decimal numbers (e.g. ``'1234,56'``
+    for 1234.56, common in Brazilian/European CSVs) and convert to float64.
+
+    Only converts when >50 % of non-empty values match the comma-decimal
+    pattern.  Values without a comma are parsed with dot-as-decimal to
+    avoid mangling values like ``'4.0'``.
+    """
+    for col in list(df.select_dtypes(include="object").columns):
+        non_null = df[col].dropna()
+        if non_null.empty:
+            continue
+        non_empty = non_null[non_null.astype(str).str.strip() != ""]
+        if len(non_empty) < 3:
+            continue
+
+        sample = non_empty.head(50).astype(str).str.strip().str.strip('"')
+        comma_match = sample.str.match(r'^-?\d[\d.]*,\d+$')
+        if comma_match.mean() < 0.5:
+            continue
+
+        try:
+            raw = df[col].astype(str).str.strip().str.strip('"')
+            has_comma = raw.str.contains(",", na=False, regex=False)
+
+            converted = pd.Series(index=df.index, dtype=float)
+
+            # Comma-decimal values: dot is thousands separator → remove,
+            # then comma → dot.
+            if has_comma.any():
+                c = (
+                    raw[has_comma]
+                    .str.replace(".", "", regex=False)
+                    .str.replace(",", ".", regex=False)
+                )
+                converted.loc[has_comma] = pd.to_numeric(c, errors="coerce")
+
+            # Non-comma values: parse normally (dot = decimal)
+            if (~has_comma).any():
+                converted.loc[~has_comma] = pd.to_numeric(
+                    raw[~has_comma], errors="coerce"
+                )
+
+            # Only apply if we preserved a reasonable fraction of data
+            if converted.notna().sum() >= len(non_empty) * 0.4:
+                df[col] = converted
+        except Exception:
+            pass
+    return df
+
+
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     normalized = df.copy()
     normalized.columns = [
@@ -44,11 +95,19 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         for index, column in enumerate(normalized.columns)
     ]
     normalized = normalized.dropna(axis=1, how="all")
-    normalized = normalized.fillna("")
 
+    # Convert comma-decimal columns (e.g. "1234,56" → 1234.56, common in
+    # Brazilian/European CSV exports) to float64 BEFORE the string-fill
+    # step so they are correctly typed as numeric.
+    normalized = _try_convert_comma_decimals(normalized)
+
+    # Only fill NaN with empty string for object/string columns.
+    # Using a blanket fillna("") converts numeric columns (float64) to
+    # object dtype whenever they contain even a single NaN, which breaks
+    # downstream column-type detection (e.g. _select_relevant_columns).
     for column in normalized.columns:
         if pd.api.types.is_object_dtype(normalized[column]):
-            normalized[column] = normalized[column].astype(str).str.strip()
+            normalized[column] = normalized[column].fillna("").astype(str).str.strip()
 
     return normalized
 

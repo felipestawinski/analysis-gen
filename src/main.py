@@ -11,6 +11,7 @@ import pandas as pd
 import base64
 import os
 import json
+import re
 from openai import OpenAI
 from dotenv import load_dotenv
 import requests
@@ -22,8 +23,10 @@ import contextvars
 from collections import OrderedDict
 from normalization import detect_file_type, dataframe_from_bytes, dataframe_preview
 
-# Load environment variables
+# Load environment variables BEFORE imports that read env vars at module level
 load_dotenv()
+
+from rag import rag_store
 
 app = FastAPI()
 
@@ -288,6 +291,14 @@ async def preload_file(request: PreloadRequest):
 
         rows, cols = df.shape
         print(f"Preload complete: {file_address} -> shape=({rows}, {cols})")
+
+        # Pre-index for RAG so the first chat query has zero indexing latency
+        try:
+            if rag_store.enabled:
+                rag_store.index_dataframe(file_address, df)
+        except Exception as rag_err:
+            print(f"[RAG] WARNING: preload indexing failed (non-fatal): {rag_err}")
+
         return {"status": "ok", "shape": [rows, cols]}
 
     except Exception as e:
@@ -567,6 +578,35 @@ def is_large_dataset(df: pd.DataFrame) -> bool:
     return rows >= LARGE_DATASET_ROW_THRESHOLD or (rows * cols) >= LARGE_DATASET_CELL_THRESHOLD
 
 
+CHART_MAX_COLUMNS = int(os.getenv("CHART_MAX_COLUMNS", "30"))
+CHART_MAX_ROWS = int(os.getenv("CHART_MAX_ROWS", "500000"))
+
+
+def _reduce_df_for_chart(df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
+    """
+    Reduce a wide DataFrame to only the columns relevant to the chart request.
+
+    Many sports/analytics files have 600+ columns but only ~3 000 rows.
+    Passing ALL columns into the chart pipeline triggers the large-dataset
+    guard (cell count) even though the row count is perfectly manageable.
+
+    This function selects up to CHART_MAX_COLUMNS columns using the
+    existing prompt-aware column ranker (_select_relevant_columns), so
+    the chart code generator and executor only see what they need.
+    """
+    if df.shape[1] <= CHART_MAX_COLUMNS:
+        return df
+
+    selected = _select_relevant_columns(df, user_prompt, CHART_MAX_COLUMNS)
+    reduced = df[selected].copy()
+    print(
+        f"[chart-reduce] Reduced DataFrame from {df.shape[1]} cols → "
+        f"{reduced.shape[1]} cols for chart generation "
+        f"(rows={reduced.shape[0]}, cells={reduced.shape[0] * reduced.shape[1]})"
+    )
+    return reduced
+
+
 def _coerce_json_value(value):
     if pd.isna(value):
         return None
@@ -580,30 +620,92 @@ def _coerce_json_value(value):
     return value
 
 
+# Portuguese/English stop words excluded from token matching so common
+# words like "com", "mais", "the" don't cause false-positive column hits.
+_COL_MATCH_STOP = frozenset({
+    "que", "qual", "quais", "com", "mais", "dos", "das", "por", "para",
+    "uma", "uns", "the", "and", "for", "are", "was", "how", "what",
+    "which", "were", "has", "como", "foram", "nos", "nas", "ele", "ela",
+    "isso", "este", "esta", "esses", "esse", "essa", "seu", "sua",
+    "cada", "entre", "sobre", "desde", "mesmo", "quando", "onde",
+})
+
+
 def _select_relevant_columns(df: pd.DataFrame, user_prompt: str, max_columns: int) -> list[str]:
+    """Return up to *max_columns* column names, prioritised by relevance
+    to *user_prompt*.
+
+    Improvements over the previous substring-only approach:
+
+    * **Token scoring** — each column is scored by how many of its name
+      tokens appear in the prompt (after stop-word removal).  A full
+      substring match (e.g. ``"passes precisos"`` found verbatim in the
+      prompt) gets the highest score.
+    * **Deterministic tie-breaking** — columns with equal scores keep
+      their original file order, so results are reproducible.
+    * **Budget-fill** — remaining slots are filled with numeric columns
+      first (most analytically useful), then categorical, then the rest.
+    """
     all_columns = list(df.columns)
     if len(all_columns) <= max_columns:
         return all_columns
 
     prompt_lower = user_prompt.lower()
-    ranked_columns: list[str] = []
+    prompt_tokens = {
+        w for w in re.findall(r'\b\w{3,}\b', prompt_lower)
+        if w not in _COL_MATCH_STOP
+    }
 
-    for col in all_columns:
-        if str(col).lower() in prompt_lower:
-            ranked_columns.append(col)
+    # --- score every column ------------------------------------------------
+    scored: list[tuple[str, int, int]] = []   # (col, score, orig_index)
+    for idx, col in enumerate(all_columns):
+        col_lower = str(col).lower()
+        score = 0
 
-    numeric_columns = [col for col in all_columns if pd.api.types.is_numeric_dtype(df[col])]
+        # Full column name is a substring of the prompt (strongest signal)
+        if col_lower in prompt_lower:
+            score += 1000
+
+        # Token-level overlap
+        col_tokens = set(re.findall(r'\b\w{3,}\b', col_lower))
+        if col_tokens and prompt_tokens:
+            overlap = col_tokens & prompt_tokens
+            if overlap:
+                # Coverage: fraction of the column name matched
+                score += int(len(overlap) / len(col_tokens) * 200)
+                # Bonus per matching token
+                score += len(overlap) * 30
+
+        scored.append((col, score, idx))
+
+    # Prompt-matched columns first (score desc, then original order)
+    matched = sorted(
+        [(c, s, i) for c, s, i in scored if s > 0],
+        key=lambda x: (-x[1], x[2]),
+    )
+
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for col, _s, _i in matched:
+        ranked.append(col)
+        seen.add(col)
+
+    # Fill remaining budget: numeric → categorical → everything else
+    numeric_columns = [c for c in all_columns if pd.api.types.is_numeric_dtype(df[c])]
     categorical_columns = [
-        col for col in all_columns if pd.api.types.is_object_dtype(df[col]) or str(df[col].dtype) in ("string", "category")
+        c for c in all_columns
+        if pd.api.types.is_object_dtype(df[c])
+        or str(df[c].dtype) in ("string", "category")
     ]
 
     for col in numeric_columns + categorical_columns + all_columns:
-        if col not in ranked_columns:
-            ranked_columns.append(col)
-        if len(ranked_columns) >= max_columns:
+        if col not in seen:
+            ranked.append(col)
+            seen.add(col)
+        if len(ranked) >= max_columns:
             break
 
-    return ranked_columns[:max_columns]
+    return ranked[:max_columns]
 
 
 def _build_sample_rows(df: pd.DataFrame, selected_columns: list[str], sample_rows: int) -> list[dict]:
@@ -620,6 +722,95 @@ def _build_sample_rows(df: pd.DataFrame, selected_columns: list[str], sample_row
 
     records = sample_df.to_dict(orient="records")
     return [{key: _coerce_json_value(value) for key, value in row.items()} for row in records]
+
+
+def _extract_prompt_columns(df: pd.DataFrame, user_prompt: str) -> list[str]:
+    """Return DataFrame columns whose name appears in *user_prompt*.
+
+    Uses substring + token-overlap matching.  Returns at most 5 columns,
+    ordered by match quality (strongest first).
+    """
+    prompt_lower = user_prompt.lower()
+    prompt_tokens = set(re.findall(r'\b\w{3,}\b', prompt_lower))
+
+    candidates: list[tuple[str, int]] = []
+    for col in df.columns:
+        col_lower = str(col).lower()
+        score = 0
+
+        # Full name in prompt
+        if col_lower in prompt_lower:
+            score += 100
+
+        # Token overlap ≥ 50 % of column tokens
+        col_tokens = set(re.findall(r'\b\w{3,}\b', col_lower))
+        if col_tokens and prompt_tokens:
+            overlap = col_tokens & prompt_tokens
+            if overlap and len(overlap) / len(col_tokens) >= 0.5:
+                score += 50
+
+        if score > 0:
+            candidates.append((col, score))
+
+    candidates.sort(key=lambda x: -x[1])
+    return [c for c, _ in candidates[:5]]
+
+
+def _build_supplementary_context(
+    df: pd.DataFrame,
+    user_prompt: str,
+    existing_context: str,
+    max_rows: int = 30,
+    max_chars: int = 8000,
+) -> str:
+    """Extract targeted rows for columns mentioned in *user_prompt*.
+
+    When a file has 700+ columns, both RAG chunks and the statistical
+    summary may exclude the columns the user is asking about.  This
+    function provides a small, targeted CSV extract containing only the
+    identifying columns (Period Name, Date, …) plus the queried columns
+    with non-null values so the LLM can cite exact figures.
+
+    Returns an empty string if no supplementary data is needed.
+    """
+    target_cols = _extract_prompt_columns(df, user_prompt)
+    if not target_cols:
+        return ""
+
+    # Only supplement columns absent from the existing RAG context
+    existing_lower = (existing_context or "").lower()
+    missing_cols = [c for c in target_cols if str(c).lower() not in existing_lower]
+    if not missing_cols:
+        return ""
+
+    # Identifying columns for row-level context
+    id_candidates = [
+        "Period Name", "Date", "Player Name",
+        "ADVERS\u00c1RIO", "CAMPEONATO", "EVENTO",
+    ]
+    id_cols = [c for c in id_candidates if c in df.columns]
+    extract_cols = list(dict.fromkeys(id_cols + missing_cols))  # dedupe, keep order
+
+    working = df[extract_cols].copy()
+
+    # Keep only rows where at least one target column has data
+    mask = pd.Series(False, index=df.index)
+    for col in missing_cols:
+        if col not in working.columns:
+            continue
+        if pd.api.types.is_numeric_dtype(working[col]):
+            mask |= working[col].notna()
+        else:
+            mask |= working[col].notna() & (working[col].astype(str).str.strip() != "")
+
+    filtered = working[mask].head(max_rows)
+    if filtered.empty:
+        return ""
+
+    buf = io.StringIO()
+    filtered.to_csv(buf, index=False)
+    text = buf.getvalue()
+    return text[:max_chars] if len(text) > max_chars else text
 
 
 def _build_dataframe_context(
@@ -704,7 +895,7 @@ def _build_dataframe_context(
     return context
 
 
-def build_llm_dataset_message(df: pd.DataFrame, user_prompt: str, large_dataset_mode: bool = False) -> str:
+def build_llm_dataset_message(df: pd.DataFrame, user_prompt: str, large_dataset_mode: bool = False, retrieved_context: str = "") -> str:
     context_profiles = [
         {"max_columns": 70, "max_numeric_stats": 30, "max_categorical_stats": 20, "max_chars": LLM_MAX_CONTEXT_CHARS},
         {"max_columns": 45, "max_numeric_stats": 20, "max_categorical_stats": 14, "max_chars": LLM_COMPACT_CONTEXT_CHARS},
@@ -726,13 +917,23 @@ def build_llm_dataset_message(df: pd.DataFrame, user_prompt: str, large_dataset_
     )
 
     def _build_message(payload: dict) -> str:
-        return (
+        base = (
             "Dataset Information (JSON):\n"
             f"{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+        )
+        if retrieved_context:
+            base += (
+                "Relevant Data Rows (retrieved via semantic search — use these "
+                "to answer row-level questions with precision):\n"
+                f"{retrieved_context}\n\n"
+            )
+        base += (
             f"User Question: {user_prompt}\n\n"
             "Answer with the same language used by the user. "
-            "Provide concise conclusions with specific values from the provided context."
+            "Provide concise conclusions with specific values from the provided context. "
+            "When relevant data rows are provided, prefer citing them over the statistical summary."
         )
+        return base
 
     message = _build_message(context_payload)
 
@@ -780,7 +981,7 @@ def token_limit_notice(user_prompt: str) -> str:
         return "⚠️ O limite de tokens foi excedido para este modelo. A resposta abaixo foi gerada em modo compacto para continuar a análise."
     return "⚠️ The token limit was exceeded for this model. The response below was generated in compact fallback mode so analysis could continue."
 
-def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str, model: str = "gpt-5-mini", stream: bool = False):
+def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str, model: str = "gpt-5-mini", stream: bool = False, retrieved_context: str = ""):
     """
     Send dataframe info and user prompt to OpenAI for analysis with fallback options.
     When stream=True, returns a generator that yields text chunks instead of a full string.
@@ -826,7 +1027,7 @@ Goal: Answer the user's question using only the provided dataset context.
 """
 
     large_dataset_mode = is_large_dataset(df)
-    user_message = build_llm_dataset_message(df, user_prompt, large_dataset_mode)
+    user_message = build_llm_dataset_message(df, user_prompt, large_dataset_mode, retrieved_context=retrieved_context)
     print(
         "OpenAI request context:",
         {
@@ -852,17 +1053,23 @@ Goal: Answer the user's question using only the provided dataset context.
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_message},
                         ],
-                        max_completion_tokens=2000,
+                        max_completion_tokens=16000,
                         stream=True,
                     )
                     print("using model (streaming)", model)
                     first_chunk = True
+                    total_yielded = 0
+                    chunk_count = 0
                     for chunk in stream_response:
                         if first_chunk:
                             print(f"OpenAI first-chunk latency: {time.perf_counter() - llm_started_at:.2f}s")
                             first_chunk = False
                         text = chunk.choices[0].delta.content or ""
+                        if text:
+                            total_yielded += len(text)
+                            chunk_count += 1
                         yield text
+                    print(f"OpenAI stream complete: {chunk_count} chunks, {total_yielded} chars yielded, {time.perf_counter() - llm_started_at:.2f}s total")
                 except Exception as e:
                     print(f"OpenAI streaming failed with model '{model}': {str(e)}")
                     # Fall back to non-streaming text and yield it as a single chunk
@@ -886,7 +1093,7 @@ Goal: Answer the user's question using only the provided dataset context.
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
-                max_completion_tokens=2000
+                max_completion_tokens=16000
             )
             _track_tokens(response)
             print("using model", model)
@@ -1090,14 +1297,29 @@ IMPORTANT RULES:
 7. Handle any potential errors (missing data, etc.)
 8. Make the visualization clear and professional
 9. If the user's language is Portuguese, use Portuguese labels; if English, use English labels
-10. The user message includes a "Data Quality Notes" section — read it carefully and apply every
-    fix listed there BEFORE building the plot (convert dtypes, filter rows, replace sentinels, etc.).
+10. The user message includes a "Data Quality Notes" section — these are HINTS about known issues.
+    Apply dtype-conversion hints (comma-decimal, timedelta) unconditionally.
+    Apply row-filtering hints (AGGREGATION-LEVEL) ONLY when the column flagged is NOT a
+    metric/count column that the user explicitly asked to compare or visualise.
+
+ENVIRONMENT CONSTRAINTS (violations will crash at runtime):
+- pandas >= 3.0, Python 3.12+
+- DO NOT use infer_datetime_format parameter — it was removed in pandas 2.0
+- DO NOT use DataFrame.append() or Series.append() — use pd.concat() instead
+- DO NOT use squeeze parameter in read_csv — it was removed in pandas 2.0
+- DO NOT re-import pandas, matplotlib, seaborn, or numpy.
+  They are pre-loaded as: pd, plt, sns, np. Use these names directly.
+- When formatting dates on a pandas Series, use .dt.strftime() NOT .strftime().
+  Series does not have strftime() directly; the datetime accessor (.dt) is required.
+
+CRITICAL — never destroy data the user asked to see:
+- If the user's request mentions a column by name (e.g. 'Red Cards', 'Yellow Cards', 'Goals'),
+  do NOT filter that column to a single value (e.g. == 0) under any circumstance.
+  Such columns are measurement/count columns, not row-type flags.
+- An AGGREGATION-LEVEL hint should be skipped entirely when the flagged column is
+  one of the columns the user wants to compare or plot.
 
 Example output format:
-```python
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 plt.figure(figsize=(12, 7))
 # Your visualization code here
 plt.title('Chart Title')
@@ -1106,7 +1328,7 @@ plt.ylabel('Y Label')
 plt.tight_layout()
 plt.savefig('output_chart.png', dpi=150, bbox_inches='tight')
 plt.close()
-```"""
+"""
     
     # Dynamically inspect the DataFrame for data-quality issues in this specific file
     quality_notes = _inspect_df_quality(df)
@@ -1140,7 +1362,7 @@ Generate Python code to create the visualization. Remember: the DataFrame is alr
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
-                max_completion_tokens=2500
+                max_completion_tokens=3500
             )
             _track_tokens(response)
             raw = response.choices[0].message.content or ""
@@ -1263,8 +1485,41 @@ def _inspect_df_quality(df: pd.DataFrame) -> str:
         )
 
     # ── 3. Aggregation-level columns (potential period / row-type flag) ────────
+    #
+    # IMPORTANT: metric/count columns (goals, cards, assists, shots, …) have the
+    # same numeric pattern as period/level flags (low cardinality, contains 0,
+    # small positive integers) but must NEVER be treated as row-type selectors.
+    # We skip any column whose name contains a known metric keyword.
+    _METRIC_KEYWORDS = {
+        # cards / discipline
+        'card', 'cards', 'yellow', 'red', 'booking', 'caution', 'foul', 'fouls',
+        # goals / scoring
+        'goal', 'goals', 'gol', 'gols', 'score', 'scored', 'assist', 'assists',
+        # shots
+        'shot', 'shots', 'attempt', 'attempts', 'chute', 'chutes',
+        # general counts / KPIs
+        'count', 'total', 'sum', 'num', 'number', 'qty', 'quantity',
+        'point', 'points', 'ponto', 'pontos',
+        'win', 'wins', 'loss', 'losses', 'draw', 'draws',
+        'pass', 'passes', 'tackle', 'tackles', 'interception', 'interceptions',
+        'save', 'saves', 'clean', 'concede', 'conceded',
+        'km', 'distance', 'minute', 'minutes', 'min',
+        'rating', 'rate', 'ratio', 'pct', 'percent',
+    }
+
+    def _is_metric_col(col_name: str) -> bool:
+        """Return True if the column name looks like a measurement/count column."""
+        name_lower = str(col_name).lower()
+        # Split on common non-alpha separators so 'yellow_cards' → ['yellow', 'cards']
+        import re as _re
+        tokens = set(_re.split(r'[\s_\-/]+', name_lower))
+        return bool(tokens & _METRIC_KEYWORDS)
+
     agg_cols = []
     for col in num_cols:
+        # Skip columns that are clearly value/count metrics
+        if _is_metric_col(col):
+            continue
         series = pd.to_numeric(df[col], errors='coerce').dropna()
         unique_vals = series.unique()
         if len(unique_vals) > 10:
@@ -1287,7 +1542,8 @@ def _inspect_df_quality(df: pd.DataFrame) -> str:
                 f"mark sub-period rows (e.g. halves, quarters).\n"
                 f"# If you are plotting one data point per event/match, filter to the "
                 f"aggregate rows first to avoid double-counting:\n"
-                f"#   df = df[pd.to_numeric(df['{col}'], errors='coerce') == 0].copy()"
+                f"#   df = df[pd.to_numeric(df['{col}'], errors='coerce') == 0].copy()\n"
+                f"# NOTE: skip this filter if '{col}' is itself a metric the user wants to plot."
             )
 
     if not notes:
@@ -1336,50 +1592,120 @@ def _preprocess_df_for_chart(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# Static lint pass for AI-generated code
+# ---------------------------------------------------------------------------
+
+_RE_INFER_DATETIME_FMT = re.compile(
+    r',\s*infer_datetime_format\s*=\s*(?:True|False)', re.IGNORECASE
+)
+_RE_SQUEEZE_KWARG = re.compile(
+    r',\s*squeeze\s*=\s*(?:True|False)', re.IGNORECASE
+)
+_RE_DF_APPEND = re.compile(
+    r'(\w+)\s*=\s*\1\.append\((.+?)\)',
+)
+_RE_IMPORT_PANDAS = re.compile(
+    r'^\s*(?:import\s+pandas(?:\s+as\s+\w+)?|from\s+pandas\s+import\s+.+)\s*$',
+    re.MULTILINE,
+)
+_RE_IMPORT_MATPLOTLIB = re.compile(
+    r'^\s*(?:import\s+matplotlib(?:\.pyplot)?(?:\s+as\s+\w+)?|from\s+matplotlib(?:\.pyplot)?\s+import\s+.+)\s*$',
+    re.MULTILINE,
+)
+_RE_IMPORT_SEABORN = re.compile(
+    r'^\s*(?:import\s+seaborn(?:\s+as\s+\w+)?|from\s+seaborn\s+import\s+.+)\s*$',
+    re.MULTILINE,
+)
+_RE_IMPORT_NUMPY = re.compile(
+    r'^\s*(?:import\s+numpy(?:\s+as\s+\w+)?|from\s+numpy\s+import\s+.+)\s*$',
+    re.MULTILINE,
+)
+# Fix .strftime() → .dt.strftime() on Series (LLMs frequently forget .dt)
+_RE_SERIES_STRFTIME = re.compile(
+    r'(?<!\.dt)\.strftime\(',
+)
+
+
+def _lint_generated_code(code: str) -> str:
+    """
+    Apply regex-based fixes to AI-generated code before execution.
+    Catches known deprecated/removed APIs and redundant imports that would
+    bypass the shimmed exec environment.
+    """
+    original = code
+
+    # 1. Strip infer_datetime_format=... from to_datetime() calls
+    code = _RE_INFER_DATETIME_FMT.sub('', code)
+
+    # 2. Strip squeeze=... from read_csv() calls
+    code = _RE_SQUEEZE_KWARG.sub('', code)
+
+    # 3. Replace df = df.append(x) → df = pd.concat([df, x])
+    code = _RE_DF_APPEND.sub(r'\1 = pd.concat([\1, \2])', code)
+
+    # 4. Remove redundant imports (pandas, matplotlib, seaborn, numpy)
+    #    These are already pre-loaded as pd, plt, sns, np in the exec env.
+    code = _RE_IMPORT_PANDAS.sub('# (import removed — pd already available)', code)
+    code = _RE_IMPORT_MATPLOTLIB.sub('# (import removed — plt already available)', code)
+    code = _RE_IMPORT_SEABORN.sub('# (import removed — sns already available)', code)
+    code = _RE_IMPORT_NUMPY.sub('# (import removed — np already available)', code)
+
+    # 5. Fix .strftime() → .dt.strftime() on pandas Series
+    code = _RE_SERIES_STRFTIME.sub('.dt.strftime(', code)
+
+    if code != original:
+        print("[chart-lint] Pre-exec lint applied fixes to generated code")
+
+    return code
+
+
 def execute_visualization_code(df: pd.DataFrame, code: str, output_path: str = "output_chart.png") -> tuple[bool, str | None]:
     """
     Execute the AI-generated visualization code safely.
     Pre-processes df (timedelta→float, comma-decimal fix) before exec().
+    Monkey-patches the real pandas module during execution so that all import
+    paths (import pandas, from pandas import ..., etc.) use the compat shims.
     Returns (True, None) on success, (False, error_message) on failure.
     """
-    # ── Pandas compatibility shims ────────────────────────────────────────────
+    # ── Pandas compatibility shims (module-level monkey-patch) ────────────────
     # AI models are trained on older pandas patterns and may generate calls with
-    # deprecated/removed kwargs. Rather than fighting code generation, we wrap
-    # the functions in the exec environment to strip the offending arguments.
+    # deprecated/removed kwargs.  We monkey-patch the real pd module so that
+    # ALL import paths are covered — not just the 'pd' alias in exec_globals.
     #
-    # Removed in pandas 2.2 / 3.x:
+    # Removed in pandas 2.0+:
     #   pd.to_datetime(infer_datetime_format=...)  → just drop the arg
     #   pd.read_csv(squeeze=...)                   → just drop the arg
+    #   DataFrame.append / Series.append           → caught by lint, but
+    #       also patched here as a last resort.
     # -------------------------------------------------------------------------
-    _REMOVED_TO_DATETIME_KWARGS = {"infer_datetime_format", "squeeze"}
+    _REMOVED_TO_DATETIME_KWARGS = {"infer_datetime_format"}
     _real_to_datetime = pd.to_datetime
+    _real_read_csv = pd.read_csv
 
     def _compat_to_datetime(*args, **kwargs):
         for k in _REMOVED_TO_DATETIME_KWARGS:
             kwargs.pop(k, None)
         return _real_to_datetime(*args, **kwargs)
 
-    _real_read_csv = pd.read_csv
-
     def _compat_read_csv(*args, **kwargs):
         kwargs.pop("squeeze", None)
         return _real_read_csv(*args, **kwargs)
 
-    # Build a patched pd module-like namespace so generated code can call
-    # pd.to_datetime / pd.read_csv transparently via the shims.
-    import types
-    pd_compat = types.ModuleType("pandas")
-    pd_compat.__dict__.update(pd.__dict__)
-    pd_compat.to_datetime = _compat_to_datetime
-    pd_compat.read_csv   = _compat_read_csv
-    # ── end shims ─────────────────────────────────────────────────────────────
+    # Apply lint fixes to the code text first
+    code = _lint_generated_code(code)
+
+    # Monkey-patch the REAL pandas module so every import path is covered
+    pd.to_datetime = _compat_to_datetime
+    pd.read_csv = _compat_read_csv
+    # ── end shim setup ────────────────────────────────────────────────────────
 
     try:
         clean_df = _preprocess_df_for_chart(df)
 
         exec_globals = {
             'df': clean_df,
-            'pd': pd_compat,
+            'pd': pd,
             'plt': plt,
             'sns': sns,
             'np': __import__('numpy'),
@@ -1403,41 +1729,76 @@ def execute_visualization_code(df: pd.DataFrame, code: str, output_path: str = "
         print(f"[chart-exec] ERROR executing generated code: {msg}\n{tb}")
         return False, f"Erro ao executar o gráfico: {msg}"
 
-def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str = "", model: str = "gpt-5-mini") -> tuple[str | None, str | None]:
+    finally:
+        # ── Restore original pandas functions ──────────────────────────────
+        pd.to_datetime = _real_to_datetime
+        pd.read_csv = _real_read_csv
+
+
+def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str = "", model: str = "gpt-5-mini") -> tuple[str | None, str | None, str | None]:
     """
     Generate a chart based on the prompt using AI-generated code.
-    Returns (chart_base64, None) on success, or (None, error_message) on failure.
-    The rule-based fallback has been removed — callers must handle the error case.
+    Returns (chart_base64, None, viz_code) on success, or (None, error_message, None) on failure.
+
+    Implements a single auto-retry: if the first attempt fails at execution,
+    the error is fed back to the LLM so it can self-correct.
     """
-    print("Attempting AI-generated visualization...")
-    viz_code, gen_error = generate_visualization_code_with_ai(df, prompt, model)
-
-    if gen_error:
-        print(f"[chart-gen] Code generation failed: {gen_error}")
-        return None, gen_error
-
-    print("Generated visualization code:")
-    print(viz_code)
-    print("-" * 50)
-
+    MAX_ATTEMPTS = 2
     output_path = "output_chart.png"
-    if os.path.exists(output_path):
-        os.remove(output_path)
+    last_error: str | None = None
 
-    success, exec_error = execute_visualization_code(df, viz_code, output_path)
-    if not success:
-        return None, exec_error or "Erro desconhecido ao executar o código de visualização."
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        # ── Code generation ────────────────────────────────────────────────
+        if attempt == 1:
+            print("Attempting AI-generated visualization...")
+            viz_code, gen_error = generate_visualization_code_with_ai(df, prompt, model)
+        else:
+            # Retry: append the previous error so the LLM can self-correct
+            retry_prompt = (
+                f"{prompt}\n\n"
+                f"[RETRY] The previous code you generated failed with this error:\n"
+                f"{last_error}\n"
+                f"Fix the code so it does not produce this error. "
+                f"Remember: pandas >= 3.0, do NOT use deprecated APIs."
+            )
+            print(f"[chart-gen] Retry attempt {attempt}: feeding error back to LLM")
+            viz_code, gen_error = generate_visualization_code_with_ai(df, retry_prompt, model)
 
-    try:
-        with open(output_path, 'rb') as img_file:
-            chart_base64 = base64.b64encode(img_file.read()).decode()
-        os.remove(output_path)
-        print("AI-generated visualization successful!")
-        return chart_base64, None
-    except Exception as e:
-        msg = f"Erro ao ler o gráfico gerado: {str(e)}"
-        print(f"[chart-gen] {msg}")
-        return None, msg
+        if gen_error:
+            print(f"[chart-gen] Code generation failed (attempt {attempt}): {gen_error}")
+            last_error = gen_error
+            continue
+
+        print(f"Generated visualization code (attempt {attempt}):")
+        print(viz_code)
+        print("-" * 50)
+
+        # ── Execution ──────────────────────────────────────────────────────
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+        success, exec_error = execute_visualization_code(df, viz_code, output_path)
+        if success:
+            try:
+                with open(output_path, 'rb') as img_file:
+                    chart_base64 = base64.b64encode(img_file.read()).decode()
+                os.remove(output_path)
+                if attempt > 1:
+                    print(f"AI-generated visualization succeeded on retry (attempt {attempt})!")
+                else:
+                    print("AI-generated visualization successful!")
+                return chart_base64, None, viz_code
+            except Exception as e:
+                msg = f"Erro ao ler o gráfico gerado: {str(e)}"
+                print(f"[chart-gen] {msg}")
+                return None, msg, None
+
+        # Execution failed — store the error for the retry prompt
+        last_error = exec_error or "Erro desconhecido ao executar o código de visualização."
+        print(f"[chart-gen] Execution failed (attempt {attempt}): {last_error}")
+
+    # All attempts exhausted
+    return None, last_error or "Erro desconhecido ao executar o código de visualização.", None
 
 def generate_chart_fallback(df: pd.DataFrame, prompt: str, analysis_response: str = "") -> str:
     """
@@ -1830,7 +2191,47 @@ async def download_csv(request: URLRequest):
         print(f"Final columns: {list(combined_df.columns)}")
         large_data_mode = is_large_dataset(combined_df)
         print(f"Large dataset mode: {large_data_mode}")
-        
+
+        # ── RAG: index the combined DataFrame and retrieve relevant rows ──
+        # Wrapped in try/except so RAG failures never block the analysis.
+        rag_file_key = "|".join(sorted(str(a) for a in request.fileAddresses))
+        retrieved_context = ""
+        try:
+            if rag_store.enabled:
+                rag_started_at = time.perf_counter()
+                if request.forceRefresh:
+                    rag_store.invalidate(rag_file_key)
+                rag_store.index_dataframe(rag_file_key, combined_df)
+                print(f"RAG index stage latency: {time.perf_counter() - rag_started_at:.2f}s")
+
+            if rag_store.enabled and not request.chartRecommendation:
+                rag_retrieve_started_at = time.perf_counter()
+                top_k = 20 if request.generateChart else 30
+                retrieved_context = rag_store.retrieve(rag_file_key, request.prompt, top_k=top_k)
+                print(f"RAG retrieval latency: {time.perf_counter() - rag_retrieve_started_at:.2f}s")
+        except Exception as rag_err:
+            print(f"[RAG] WARNING: RAG failed, continuing without retrieval context: {rag_err}")
+            retrieved_context = ""
+
+        # ── Supplementary context for query-specific columns ──────────
+        # Wide files (700+ cols) may have prompt-relevant columns missing
+        # from both RAG chunks and the statistical summary.  Extract them
+        # directly from the DataFrame so the LLM can cite exact values.
+        try:
+            supplementary = _build_supplementary_context(
+                combined_df, request.prompt, retrieved_context,
+            )
+            if supplementary:
+                sep = "\n\n--- Targeted data for columns mentioned in your query ---\n"
+                retrieved_context = (
+                    (retrieved_context + sep + supplementary)
+                    if retrieved_context
+                    else supplementary
+                )
+                print(f"[SUP] Supplementary context: {len(supplementary)} chars")
+        except Exception as sup_err:
+            print(f"[SUP] WARNING: supplementary extraction failed: {sup_err}")
+
         # Route to chart recommendation or regular analysis
         analysis_started_at = time.perf_counter()
         if request.chartRecommendation:
@@ -1844,7 +2245,8 @@ async def download_csv(request: URLRequest):
             # ── TEXT-ONLY PATH: stream the response directly to the client ──
             print("Generating streaming text analysis...")
             text_generator = analyze_dataframe_with_openai(
-                combined_df, request.prompt, request.model, stream=True
+                combined_df, request.prompt, request.model, stream=True,
+                retrieved_context=retrieved_context,
             )
             print(f"Analysis stage latency (stream started): {time.perf_counter() - analysis_started_at:.2f}s")
             return StreamingResponse(text_generator, media_type="text/plain")
@@ -1853,18 +2255,31 @@ async def download_csv(request: URLRequest):
 
         # Only generate chart when explicitly requested by the user via the "Gerar Gráfico" button
         chart_base64 = None
+        chart_code = None
         response_message = None
         if request.generateChart:
-            if large_data_mode:
-                response_message = "Gráfico adiado para manter a resposta rápida com arquivo grande. Refine o filtro/pergunta para gerar o gráfico."
-                print("Chart generation deferred due to large dataset mode.")
+            chart_started_at = time.perf_counter()
+
+            # Smart reduction: narrow wide DataFrames to only chart-relevant columns
+            # so that files with many columns but few rows (e.g. 3 000 rows × 759 cols)
+            # are not incorrectly deferred.
+            chart_df = _reduce_df_for_chart(combined_df, request.prompt)
+
+            if chart_df.shape[0] > CHART_MAX_ROWS:
+                response_message = (
+                    "O dataset possui muitas linhas para gerar o gráfico. "
+                    "Refine o filtro para reduzir os dados."
+                )
+                print(f"Chart generation deferred: {chart_df.shape[0]} rows exceeds CHART_MAX_ROWS={CHART_MAX_ROWS}.")
             else:
-                chart_started_at = time.perf_counter()
-                print("Generating chart (explicit request)...")
-                chart_base64, chart_error = generate_chart_from_prompt(combined_df, request.prompt, "", request.model)
+                print(f"Generating chart (explicit request) with shape {chart_df.shape}...")
+                chart_base64, chart_error, chart_code = generate_chart_from_prompt(
+                    chart_df, request.prompt, "", request.model
+                )
                 if chart_error:
                     response_message = chart_error
-                print(f"Chart stage latency: {time.perf_counter() - chart_started_at:.2f}s")
+
+            print(f"Chart stage latency: {time.perf_counter() - chart_started_at:.2f}s")
 
         # Create data summary
         data_summary = {
@@ -1876,7 +2291,7 @@ async def download_csv(request: URLRequest):
             "files_processed": len(request.fileAddresses),
             "file_types": processed_file_types,
             "visualization_generated": chart_base64 is not None,
-            "chart_deferred": bool(request.generateChart and large_data_mode),
+            "chart_deferred": bool(request.generateChart and chart_base64 is None and response_message is not None),
             "large_dataset_mode": large_data_mode,
         }
         print(f"Total /analysis-gen latency: {time.perf_counter() - started_at:.2f}s")
@@ -1889,6 +2304,7 @@ async def download_csv(request: URLRequest):
         return {
             "text_response": analysis_text,
             "chart_base64": chart_base64,
+            "chart_code": chart_code,
             "data_summary": data_summary,
             "message": response_message,
             "tokens_used": total_tokens_used,

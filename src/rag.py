@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import re
 import time
 from typing import Optional
 
@@ -119,23 +120,38 @@ def _dataframe_chunk_to_text(df_chunk: pd.DataFrame) -> str:
        key columns (dates, names, categories).  This dramatically improves
        embedding similarity for exact-value queries like "1/20/2024".
     2. The raw CSV data so the LLM can cite specific numbers.
+
+    For numeric identity columns (e.g. ``Player Name`` with int IDs like
+    1, 2, 3), the summary labels them as "Player 1, Player 2, …" so that
+    semantic search can match queries like "player 1 and player 2".
     """
+    # Keywords that signal a column is an identity/entity column
+    _IDENTITY_KWS = {'name', 'player', 'jogador', 'atleta', 'team', 'time',
+                     'equipe', 'position', 'date', 'period', 'evento',
+                     'adversário', 'adversario', 'campeonato'}
+
     # --- Build summary of key column values for search quality -----------
     summary_parts: list[str] = []
     for col in df_chunk.columns:
-        col_lower = col.lower()
-        is_key = (
-            "date" in col_lower
-            or "name" in col_lower
-            or "player" in col_lower
-            or "team" in col_lower
-            or "position" in col_lower
-            or "period" in col_lower
+        col_lower = str(col).lower().strip()
+        col_tokens = set(re.findall(r'\b\w{3,}\b', col_lower))
+        is_key = bool(col_tokens & _IDENTITY_KWS) or any(
+            kw in col_lower for kw in ('date', 'name', 'player', 'period')
         )
         if is_key:
-            uniques = df_chunk[col].dropna().astype(str).unique()
+            is_numeric = pd.api.types.is_numeric_dtype(df_chunk[col])
+            uniques = df_chunk[col].dropna().unique()
             if len(uniques) > 0 and len(uniques) <= 20:
-                summary_parts.append(f"{col}: {', '.join(uniques[:10])}")
+                if is_numeric:
+                    # Label numeric IDs with the column concept so
+                    # embeddings capture "Player 1" not just "1".
+                    # e.g. "Player Name" → prefix "Player"
+                    prefix_word = col_lower.split()[0].title() if ' ' in col_lower else col_lower.title()
+                    labeled = [f"{prefix_word} {int(v)}" for v in sorted(uniques)]
+                    summary_parts.append(f"{col}: {', '.join(labeled[:10])}")
+                else:
+                    str_uniques = [str(v) for v in uniques[:10]]
+                    summary_parts.append(f"{col}: {', '.join(str_uniques)}")
 
     summary = ""
     if summary_parts:
@@ -407,11 +423,17 @@ class RAGStore:
 
         # --- Hybrid search: extract specific values from the query --------
         # Dates like 1/20/2024, 2024-01-20, 20/01/2024
-        import re
         date_patterns = re.findall(
             r'\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b',
             query
         )
+
+        # Entity+number references like "player 1", "jogador 2", "atleta 10"
+        _ENTITY_PATTERN = re.compile(
+            r'\b(player|jogador|atleta|team|time|equipe)\s+(\d+)\b',
+            re.IGNORECASE,
+        )
+        entity_refs = _ENTITY_PATTERN.findall(query)
 
         started_at = time.perf_counter()
         results = None
@@ -431,6 +453,36 @@ class RAGStore:
                         break
                 except Exception:
                     pass  # filter not supported or no matches — fall through
+
+        # Strategy 1.5: entity+number filtering — e.g. "player 1", "player 2"
+        # The chunk summary labels numeric IDs as "Player 1", "Player 2", etc.
+        # so we search for those labeled strings to find the right chunks.
+        if entity_refs and (results is None or not results.get("documents") or not results["documents"][0]):
+            # Collect chunks that match ANY of the entity references
+            all_entity_docs: list[str] = []
+            seen_ids: set[str] = set()
+            for entity_word, entity_num in entity_refs:
+                # The chunk text uses title-case prefix: "Player 1", "Jogador 2"
+                search_label = f"{entity_word.title()} {entity_num}"
+                try:
+                    filtered = collection.query(
+                        query_texts=[query],
+                        n_results=min(k, available),
+                        where_document={"$contains": search_label},
+                    )
+                    if filtered and filtered.get("documents") and filtered["documents"][0]:
+                        for doc_id, doc in zip(filtered["ids"][0], filtered["documents"][0]):
+                            if doc_id not in seen_ids:
+                                all_entity_docs.append(doc)
+                                seen_ids.add(doc_id)
+                        print(f"[RAG] Entity search: found chunks containing '{search_label}'")
+                except Exception:
+                    pass
+
+            if all_entity_docs:
+                # Build a synthetic results dict compatible with downstream processing
+                results = {"documents": [all_entity_docs[:k]], "ids": [list(seen_ids)[:k]]}
+                print(f"[RAG] Entity search total: {len(all_entity_docs)} unique chunks for {len(entity_refs)} entities")
 
         # Strategy 2: fallback to pure semantic search
         if results is None or not results.get("documents") or not results["documents"][0]:

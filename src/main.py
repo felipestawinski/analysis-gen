@@ -60,7 +60,7 @@ class URLRequest(BaseModel):
     chartRecommendation: bool = False
     chatId: Optional[str] = None
     forceRefresh: bool = False
-    model: str = "gpt-5-mini"
+    model: str = "gpt-4o"
 
 
 class PreviewRequest(BaseModel):
@@ -591,18 +591,29 @@ def _reduce_df_for_chart(df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
     guard (cell count) even though the row count is perfectly manageable.
 
     This function selects up to CHART_MAX_COLUMNS columns using the
-    existing prompt-aware column ranker (_select_relevant_columns), so
-    the chart code generator and executor only see what they need.
+    existing prompt-aware column ranker (_select_relevant_columns), then
+    force-adds identity columns (Player Name, Period Name, Date, etc.)
+    so the chart code generator always has access to grouping/filtering
+    columns — even when metric columns dominate the prompt match.
     """
     if df.shape[1] <= CHART_MAX_COLUMNS:
         return df
 
     selected = _select_relevant_columns(df, user_prompt, CHART_MAX_COLUMNS)
+
+    # Force identity columns into the selection — these are essential for
+    # any chart that groups/filters by player, game, date, etc.
+    roles = _detect_column_roles(df)
+    for col in roles["identity"]:
+        if col not in selected and col in df.columns:
+            selected.append(col)
+
     reduced = df[selected].copy()
     print(
         f"[chart-reduce] Reduced DataFrame from {df.shape[1]} cols → "
         f"{reduced.shape[1]} cols for chart generation "
-        f"(rows={reduced.shape[0]}, cells={reduced.shape[0] * reduced.shape[1]})"
+        f"(rows={reduced.shape[0]}, cells={reduced.shape[0] * reduced.shape[1]}, "
+        f"identity_cols={len(roles['identity'])})"
     )
     return reduced
 
@@ -631,6 +642,24 @@ _COL_MATCH_STOP = frozenset({
 })
 
 
+# Concept synonym map: bridges user language ("game") to column naming
+# conventions ("period", "jogo", "match") so the column ranker scores
+# relevant identity columns higher even when names don't overlap.
+_CONCEPT_SYNONYMS: dict[str, set[str]] = {
+    'game':     {'jogo', 'match', 'period', 'event', 'partida', 'evento'},
+    'player':   {'jogador', 'atleta', 'name', 'player'},
+    'heart':    {'heart', 'cardíaco', 'cardíaca', 'bpm'},
+    'speed':    {'velocity', 'velocidade', 'sprint'},
+    'distance': {'odometer', 'distância', 'dist'},
+    'team':     {'time', 'equipe', 'club', 'clube'},
+    'match':    {'jogo', 'game', 'partida', 'period', 'event', 'evento'},
+    'rate':     {'rate', 'taxa', 'freq'},
+    'average':  {'avg', 'mean', 'média'},
+    'jogo':     {'game', 'match', 'partida', 'period', 'event'},
+    'jogador':  {'player', 'atleta', 'name'},
+}
+
+
 def _select_relevant_columns(df: pd.DataFrame, user_prompt: str, max_columns: int) -> list[str]:
     """Return up to *max_columns* column names, prioritised by relevance
     to *user_prompt*.
@@ -641,6 +670,9 @@ def _select_relevant_columns(df: pd.DataFrame, user_prompt: str, max_columns: in
       tokens appear in the prompt (after stop-word removal).  A full
       substring match (e.g. ``"passes precisos"`` found verbatim in the
       prompt) gets the highest score.
+    * **Concept synonyms** — prompt tokens are expanded via
+      ``_CONCEPT_SYNONYMS`` so that user words like ``"game"`` boost
+      columns named ``"Period Name"`` or ``"EVENTO"``.
     * **Deterministic tie-breaking** — columns with equal scores keep
       their original file order, so results are reproducible.
     * **Budget-fill** — remaining slots are filled with numeric columns
@@ -656,6 +688,13 @@ def _select_relevant_columns(df: pd.DataFrame, user_prompt: str, max_columns: in
         if w not in _COL_MATCH_STOP
     }
 
+    # Expand prompt tokens with concept synonyms so "game" → {"jogo", "match", …}
+    expanded_tokens = set(prompt_tokens)
+    for token in prompt_tokens:
+        syns = _CONCEPT_SYNONYMS.get(token)
+        if syns:
+            expanded_tokens |= syns
+
     # --- score every column ------------------------------------------------
     scored: list[tuple[str, int, int]] = []   # (col, score, orig_index)
     for idx, col in enumerate(all_columns):
@@ -666,7 +705,7 @@ def _select_relevant_columns(df: pd.DataFrame, user_prompt: str, max_columns: in
         if col_lower in prompt_lower:
             score += 1000
 
-        # Token-level overlap
+        # Token-level overlap (direct match)
         col_tokens = set(re.findall(r'\b\w{3,}\b', col_lower))
         if col_tokens and prompt_tokens:
             overlap = col_tokens & prompt_tokens
@@ -676,6 +715,13 @@ def _select_relevant_columns(df: pd.DataFrame, user_prompt: str, max_columns: in
                 # Bonus per matching token
                 score += len(overlap) * 30
 
+        # Token-level overlap via synonym expansion (weaker signal)
+        if col_tokens and expanded_tokens and score == 0:
+            syn_overlap = col_tokens & expanded_tokens
+            if syn_overlap:
+                score += int(len(syn_overlap) / len(col_tokens) * 150)
+                score += len(syn_overlap) * 20
+
         scored.append((col, score, idx))
 
     # Prompt-matched columns first (score desc, then original order)
@@ -684,11 +730,23 @@ def _select_relevant_columns(df: pd.DataFrame, user_prompt: str, max_columns: in
         key=lambda x: (-x[1], x[2]),
     )
 
+    # --- Seed with identity columns FIRST ----------------------------------
+    # Identity columns (Player Name, Period Name, Date, etc.) must always
+    # be included so the LLM can write grouping/filtering code.  Without
+    # them, prompts like "compare player 1 and player 2" fail because
+    # the DataFrame only contains metric columns (e.g. Heart Rate Band N).
     ranked: list[str] = []
     seen: set[str] = set()
+    roles = _detect_column_roles(df)
+    for col in roles["identity"]:
+        if col in all_columns and col not in seen:
+            ranked.append(col)
+            seen.add(col)
+
     for col, _s, _i in matched:
-        ranked.append(col)
-        seen.add(col)
+        if col not in seen:
+            ranked.append(col)
+            seen.add(col)
 
     # Fill remaining budget: numeric → categorical → everything else
     numeric_columns = [c for c in all_columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -706,6 +764,84 @@ def _select_relevant_columns(df: pd.DataFrame, user_prompt: str, max_columns: in
             break
 
     return ranked[:max_columns]
+
+
+# ---------------------------------------------------------------------------
+# Column role detection — classifies columns as identity, metric, or dimension
+# ---------------------------------------------------------------------------
+
+# Identity keywords: terms that signal a column is for grouping / filtering.
+_IDENTITY_KEYWORDS = frozenset({
+    'name', 'date', 'mando', 'resultado', 'atividade', 'microciclo',
+    'campeonato', 'adversário', 'adversario', 'semana',
+})
+
+# Metric indicators: when these appear in a column name ALONGSIDE an identity
+# keyword, the column is a measurement, not an identity column.
+# Example: "Player Load Band 1 Dist" has 'player' but also 'band'+'dist' → metric.
+_METRIC_INDICATORS = frozenset({
+    'band', 'dist', 'dur', 'eff', 'load', 'rate', 'heart', 'velocity',
+    'acceleration', 'power', 'running', 'recovery', 'ima', 'tackles',
+    'metabolic', 'rhie', 'count', 'exertion', 'odometer', 'peak',
+    'unix', 'avg', 'min', 'max', 'per', 'tot', 'free', 'field',
+    'bench', 'impacts', 'deliveries', 'possessions', 'equivalent',
+})
+
+# Columns whose full name (lowered) matches these patterns are always identity,
+# regardless of other heuristics.  Covers common sports-data column names.
+_IDENTITY_EXACT_PATTERNS = {
+    'player name', 'period name', 'period number', 'date', 'position',
+    'start time', 'end time', 'duration',
+}
+
+
+def _detect_column_roles(df: pd.DataFrame) -> dict[str, list[str]]:
+    """Classify every column into identity, metric, or dimension roles.
+
+    * **identity** — columns used for grouping / filtering (player, date,
+      event, period, etc.).  Kept tight (typically 10-25 columns) so the
+      entity-model prompt section stays concise.
+    * **metric** — numeric measurement columns.
+    * **dimension** — everything else (high-cardinality text, etc.).
+
+    The classification is used to enrich the chart-gen prompt so the LLM
+    knows which columns to use for x-axis / hue / filtering vs y-axis.
+    """
+    identity: list[str] = []
+    metric: list[str] = []
+    dimension: list[str] = []
+
+    for col in df.columns:
+        col_lower = str(col).lower().strip()
+        tokens = set(re.findall(r'\b\w{3,}\b', col_lower))
+        is_numeric = pd.api.types.is_numeric_dtype(df[col])
+        has_metric_indicator = bool(tokens & _METRIC_INDICATORS)
+
+        # --- Rule 1: exact-pattern match (highest confidence) ---------------
+        if col_lower in _IDENTITY_EXACT_PATTERNS:
+            identity.append(col)
+            continue
+
+        # --- Rule 2: keyword match WITHOUT metric indicators ----------------
+        # "Player Name" → has 'name' keyword, no metric indicator → identity
+        # "Player Load Band 1 Dist" → has metric indicators → metric
+        if (tokens & _IDENTITY_KEYWORDS) and not has_metric_indicator:
+            identity.append(col)
+            continue
+
+        # --- Rule 3: non-numeric, no metric indicators, low cardinality -----
+        if not is_numeric and not has_metric_indicator:
+            nunique = df[col].nunique()
+            if nunique < max(10, int(len(df) * 0.3)):
+                identity.append(col)
+            else:
+                dimension.append(col)
+            continue
+
+        # --- Default: metric ------------------------------------------------
+        metric.append(col)
+
+    return {"identity": identity, "metric": metric, "dimension": dimension}
 
 
 def _build_sample_rows(df: pd.DataFrame, selected_columns: list[str], sample_rows: int) -> list[dict]:
@@ -756,6 +892,14 @@ def _extract_prompt_columns(df: pd.DataFrame, user_prompt: str) -> list[str]:
     return [c for c, _ in candidates[:5]]
 
 
+# Regex to extract entity+number patterns from a user prompt.
+# Matches: "player 1", "jogador 2", "atleta 10", etc.
+_ENTITY_VALUE_RE = re.compile(
+    r'\b(?:player|jogador|atleta|team|time|equipe)\s+(\d+)\b',
+    re.IGNORECASE,
+)
+
+
 def _build_supplementary_context(
     df: pd.DataFrame,
     user_prompt: str,
@@ -771,8 +915,65 @@ def _build_supplementary_context(
     identifying columns (Period Name, Date, …) plus the queried columns
     with non-null values so the LLM can cite exact figures.
 
+    When the prompt mentions specific entity values ("player 1 and player 2"),
+    the function **always** injects balanced rows for those entities,
+    regardless of whether the entity column already appears in the RAG
+    context.  This is critical because RAG may have returned rows for
+    *different* entity values (e.g. Player 39 instead of Player 1).
+
     Returns an empty string if no supplementary data is needed.
     """
+
+    # Identifying columns for row-level context
+    id_candidates = [
+        "Period Name", "Date", "Player Name",
+        "ADVERS\u00c1RIO", "CAMPEONATO", "EVENTO",
+    ]
+    # Also try column names with leading spaces (common in this dataset)
+    id_cols: list[str] = []
+    for c in id_candidates:
+        if c in df.columns:
+            id_cols.append(c)
+        elif f" {c}" in df.columns:
+            id_cols.append(f" {c}")
+
+    # --- Priority path: entity-value queries ----------------------------
+    # When the prompt mentions specific entities (e.g. "player 1 and
+    # player 2"), extract rows for those entities directly from the full
+    # DataFrame.  This MUST run BEFORE the missing_cols check because
+    # the entity column (Player Name) is usually present in the RAG
+    # context — but with the WRONG values (e.g. Player 39 instead of 1).
+    entity_values = [int(v) for v in _ENTITY_VALUE_RE.findall(user_prompt)]
+    if entity_values:
+        identity_cols = _detect_column_roles(df)["identity"]
+        entity_col = None
+        for ic in identity_cols:
+            if ic in df.columns and pd.api.types.is_numeric_dtype(df[ic]):
+                col_vals = set(df[ic].dropna().astype(int).unique())
+                if all(v in col_vals for v in entity_values):
+                    entity_col = ic
+                    break
+
+        if entity_col:
+            # Build the extract using identity cols + the entity column
+            extract_cols = list(dict.fromkeys(id_cols + [entity_col]))
+            working = df[extract_cols].copy()
+
+            per_entity = max(1, max_rows // len(entity_values))
+            parts = []
+            for ev in entity_values:
+                entity_rows = working[working[entity_col] == ev].head(per_entity)
+                parts.append(entity_rows)
+            filtered = pd.concat(parts).head(max_rows)
+            print(f"[SUP] Entity-aware filter: col='{entity_col}', values={entity_values}, rows={len(filtered)}")
+
+            if not filtered.empty:
+                buf = io.StringIO()
+                filtered.to_csv(buf, index=False)
+                text = buf.getvalue()
+                return text[:max_chars] if len(text) > max_chars else text
+
+    # --- Fallback path: missing-column supplementation ------------------
     target_cols = _extract_prompt_columns(df, user_prompt)
     if not target_cols:
         return ""
@@ -783,12 +984,6 @@ def _build_supplementary_context(
     if not missing_cols:
         return ""
 
-    # Identifying columns for row-level context
-    id_candidates = [
-        "Period Name", "Date", "Player Name",
-        "ADVERS\u00c1RIO", "CAMPEONATO", "EVENTO",
-    ]
-    id_cols = [c for c in id_candidates if c in df.columns]
     extract_cols = list(dict.fromkeys(id_cols + missing_cols))  # dedupe, keep order
 
     working = df[extract_cols].copy()
@@ -862,24 +1057,50 @@ def _build_dataframe_context(
             "top_values": series.value_counts().head(3).to_dict(),
         }
 
+    # Detect identity columns so numeric IDs get sample values, not just
+    # min/max/mean stats.  Without this, the LLM can't tell that "Player
+    # Name" = 1 means "player 1", not a generic numeric measurement.
+    identity_col_set = set(_detect_column_roles(df)["identity"])
+
     schema_preview = {}
     for col in selected_columns:
         dtype_str = str(working_df[col].dtype)
         is_numeric = col in numeric_columns
-        col_meta: dict = {
-            "dtype": dtype_str,
-            "kind": "numeric" if is_numeric else "categorical",
-        }
-        if is_numeric and col in numeric_summary:
-            stats = numeric_summary[col]
-            col_meta["min"] = stats["min"]
-            col_meta["max"] = stats["max"]
-            col_meta["mean"] = stats["mean"]
-            col_meta["median"] = stats["median"]
-        elif col in categorical_summary:
-            cat = categorical_summary[col]
-            col_meta["unique_count"] = cat["unique_values"]
-            col_meta["top_3"] = list(cat["top_values"].keys())[:3]
+        is_identity = col in identity_col_set
+
+        # Identity columns that happen to be numeric (e.g. Player Name
+        # with int IDs 1..46) are labelled as "identity" and receive
+        # sample values + unique_count so the LLM knows the integers
+        # are entity identifiers, not measurements.
+        if is_numeric and is_identity:
+            sample_vals = working_df[col].dropna().unique()
+            col_meta: dict = {
+                "dtype": dtype_str,
+                "kind": "identity",
+                "role_hint": "This column contains entity identifiers used for grouping/filtering, not measurements.",
+                "unique_count": int(working_df[col].nunique()),
+                "sample_values": sorted([int(v) if float(v) == int(v) else float(v) for v in sample_vals[:20]]),
+            }
+        elif is_numeric:
+            col_meta = {
+                "dtype": dtype_str,
+                "kind": "numeric",
+            }
+            if col in numeric_summary:
+                stats = numeric_summary[col]
+                col_meta["min"] = stats["min"]
+                col_meta["max"] = stats["max"]
+                col_meta["mean"] = stats["mean"]
+                col_meta["median"] = stats["median"]
+        else:
+            col_meta = {
+                "dtype": dtype_str,
+                "kind": "categorical",
+            }
+            if col in categorical_summary:
+                cat = categorical_summary[col]
+                col_meta["unique_count"] = cat["unique_values"]
+                col_meta["top_3"] = list(cat["top_values"].keys())[:3]
         schema_preview[str(col)] = col_meta
 
     context = {
@@ -981,7 +1202,7 @@ def token_limit_notice(user_prompt: str) -> str:
         return "⚠️ O limite de tokens foi excedido para este modelo. A resposta abaixo foi gerada em modo compacto para continuar a análise."
     return "⚠️ The token limit was exceeded for this model. The response below was generated in compact fallback mode so analysis could continue."
 
-def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str, model: str = "gpt-5-mini", stream: bool = False, retrieved_context: str = ""):
+def analyze_dataframe_with_openai(df: pd.DataFrame, user_prompt: str, model: str = "gpt-4o", stream: bool = False, retrieved_context: str = ""):
     """
     Send dataframe info and user prompt to OpenAI for analysis with fallback options.
     When stream=True, returns a generator that yields text chunks instead of a full string.
@@ -1254,7 +1475,7 @@ def analyze_dataframe_fallback(df: pd.DataFrame, user_prompt: str) -> str:
     else:
         return "\n".join(analysis) if analysis else "Unable to analyze the data for this specific question."
 
-def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str, model: str = "gpt-5-mini") -> str:
+def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str, model: str = "gpt-4o") -> str:
     """
     Use AI to generate Python code for visualization based on user prompt
     Returns only the Python code as a string
@@ -1265,6 +1486,8 @@ def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str, mode
     # Tier 2 (relevant columns): full detail (dtype + sample values) only for
     #   the top-N columns ranked by _select_relevant_columns(), which scores
     #   columns against the user prompt using keyword matching.
+    # Tier 3 (identity columns): always included with full detail so the LLM
+    #   knows which columns to use for grouping/filtering.
     # This preserves response quality for whatever the user asks while keeping
     # token usage bounded regardless of file width.
     # -------------------------------------------------------------------------
@@ -1275,6 +1498,17 @@ def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str, mode
     relevant_cols = _select_relevant_columns(              # Tier 2 — full detail
         df, user_prompt, max_columns=MAX_DETAIL_COLS
     )
+
+    # --- Tier 3: force identity columns into the detailed schema ------------
+    # Identity columns (Player Name, Period Name, Date, …) must always appear
+    # with their dtype and sample values so the LLM doesn't hallucinate names
+    # like 'player_id' or 'game_id'.
+    roles = _detect_column_roles(df)
+    identity_cols = roles["identity"]
+    for col in identity_cols:
+        if col not in relevant_cols and col in df.columns:
+            relevant_cols.append(col)
+
     relevant_dtypes = {col: str(df.dtypes[col]) for col in relevant_cols}
     relevant_sample = df[relevant_cols].head(MAX_SAMPLE_ROWS).to_dict(orient="records")
     relevant_numeric = [
@@ -1284,6 +1518,32 @@ def generate_visualization_code_with_ai(df: pd.DataFrame, user_prompt: str, mode
         col for col in relevant_cols
         if pd.api.types.is_object_dtype(df[col]) or str(df[col].dtype) in ("string", "category")
     ]
+
+    # --- Build entity-model hint for the LLM --------------------------------
+    # Tells the LLM exactly which columns are for grouping/filtering vs
+    # aggregation, including sample values so it can write correct filters.
+    id_col_details = {}
+    for col in identity_cols[:15]:  # cap to avoid prompt bloat
+        sample_vals = df[col].dropna().unique()[:8]
+        id_col_details[col] = {
+            "dtype": str(df[col].dtype),
+            "nunique": int(df[col].nunique()),
+            "sample_values": [str(v) for v in sample_vals],
+        }
+
+    metric_cols_preview = roles["metric"][:30]
+    entity_model_section = f"""
+# ENTITY MODEL — How this dataset is structured:
+# Identity/grouping columns (use these for filtering, grouping, hue, x-axis):
+#   {json.dumps(id_col_details, ensure_ascii=False, default=str)}
+# Metric columns (use these for y-axis, aggregation):
+#   {metric_cols_preview}  (showing first {len(metric_cols_preview)} of {len(roles['metric'])})
+#
+# CRITICAL: Use ONLY column names from the lists above or the ALL column names list.
+# Do NOT invent column names like 'player_id', 'game_id', 'match_id', etc.
+# When the user says 'player', the correct column is most likely one of: {[c for c in identity_cols if 'name' in c.lower() or 'player' in c.lower() or 'jogador' in c.lower()][:3] or identity_cols[:2]}
+# When the user says 'game' or 'match', the correct column is most likely one of: {[c for c in identity_cols if any(k in c.lower() for k in ('period', 'event', 'jogo', 'match', 'adversário', 'adversario'))][:3] or identity_cols[:2]}
+"""
     
     system_prompt = """You are a Python data visualization expert. Generate ONLY executable Python code to create a visualization based on the user's request.
 
@@ -1301,6 +1561,9 @@ IMPORTANT RULES:
     Apply dtype-conversion hints (comma-decimal, timedelta) unconditionally.
     Apply row-filtering hints (AGGREGATION-LEVEL) ONLY when the column flagged is NOT a
     metric/count column that the user explicitly asked to compare or visualise.
+11. The user message includes an "ENTITY MODEL" section that tells you which columns are
+    for grouping/filtering (identity) and which are for measurement (metric).
+    ALWAYS use the exact column names from this section — NEVER invent new column names.
 
 ENVIRONMENT CONSTRAINTS (violations will crash at runtime):
 - pandas >= 3.0, Python 3.12+
@@ -1345,7 +1608,7 @@ plt.close()
 # - Relevant numeric:    {relevant_numeric}
 # - Relevant categorical:{relevant_categorical}
 # - Sample data ({MAX_SAMPLE_ROWS} rows, relevant cols only): {relevant_sample}
-
+{entity_model_section}
 # Data Quality Notes (apply these fixes in your code before plotting):
 {quality_notes}
 
@@ -1660,6 +1923,22 @@ def _lint_generated_code(code: str) -> str:
     return code
 
 
+def _validate_column_references(code: str, df_columns: set[str]) -> list[str]:
+    """Find column names referenced in generated code that don't exist in the DataFrame.
+
+    Scans for ``df['col']`` and ``df["col"]`` patterns.  Returns a list of
+    column names that appear in the code but are NOT in *df_columns*.
+    An empty list means all referenced columns are valid.
+    """
+    # Match df['col_name'] and df["col_name"]
+    pattern = r"""df\[['"](.+?)['"]]"""  # noqa: W605
+    referenced = set(re.findall(pattern, code))
+    missing = [col for col in referenced if col not in df_columns]
+    if missing:
+        print(f"[chart-validate] Hallucinated columns detected: {missing}")
+    return missing
+
+
 def execute_visualization_code(df: pd.DataFrame, code: str, output_path: str = "output_chart.png") -> tuple[bool, str | None]:
     """
     Execute the AI-generated visualization code safely.
@@ -1735,7 +2014,7 @@ def execute_visualization_code(df: pd.DataFrame, code: str, output_path: str = "
         pd.read_csv = _real_read_csv
 
 
-def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str = "", model: str = "gpt-5-mini") -> tuple[str | None, str | None, str | None]:
+def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response: str = "", model: str = "gpt-4o") -> tuple[str | None, str | None, str | None]:
     """
     Generate a chart based on the prompt using AI-generated code.
     Returns (chart_base64, None, viz_code) on success, or (None, error_message, None) on failure.
@@ -1772,6 +2051,19 @@ def generate_chart_from_prompt(df: pd.DataFrame, prompt: str, analysis_response:
         print(f"Generated visualization code (attempt {attempt}):")
         print(viz_code)
         print("-" * 50)
+
+        # ── Pre-execution validation: check for hallucinated columns ───────
+        missing_cols = _validate_column_references(viz_code, set(df.columns))
+        if missing_cols:
+            roles = _detect_column_roles(df)
+            last_error = (
+                f"Your code references columns that don't exist in the DataFrame: {missing_cols}. "
+                f"The actual identity/grouping columns are: {roles['identity'][:10]}. "
+                f"The actual metric columns include: {[c for c in roles['metric'] if any(t in c.lower() for t in re.findall(r'\b\w{3,}\b', prompt.lower()))][:10] or roles['metric'][:10]}. "
+                f"Use ONLY column names that exist in the DataFrame."
+            )
+            print(f"[chart-gen] Column validation failed (attempt {attempt}): {last_error}")
+            continue
 
         # ── Execution ──────────────────────────────────────────────────────
         if os.path.exists(output_path):
@@ -2041,7 +2333,7 @@ def recommend_chart_type(df: pd.DataFrame) -> str:
     return "\n".join(recommendations)
 
 
-def recommend_chart_type_with_ai(df: pd.DataFrame, model: str = "gpt-5-mini") -> str:
+def recommend_chart_type_with_ai(df: pd.DataFrame, model: str = "gpt-4o") -> str:
     """
     Use OpenAI to provide intelligent chart recommendations. Falls back to heuristic version.
     """
@@ -2115,7 +2407,7 @@ async def download_csv(request: URLRequest):
                 detail=f"Máximo de {MAX_FILES_PER_ANALYSIS_REQUEST} arquivos por análise. Reduza a seleção e tente novamente.",
             )
 
-        resolved_model = request.model.strip() if request.model and request.model.strip() else "gpt-5-mini"
+        resolved_model = request.model.strip() if request.model and request.model.strip() else "gpt-4o"
         request.model = resolved_model
 
         async def load_single_dataframe(
@@ -2152,7 +2444,7 @@ async def download_csv(request: URLRequest):
                     request.forceRefresh,
                 )
                 print(f"Loaded DataFrame {idx + 1} with shape: {df_local.shape}")
-                print(f"Columns: {list(df_local.columns)}")
+                print(f"Columns: {list(df_local.columns[:10])}")
                 return idx, df_local, resolved_file_type
         
         # Download and parse all tabular files
@@ -2188,7 +2480,7 @@ async def download_csv(request: URLRequest):
         print(f"Combine stage latency: {time.perf_counter() - combine_started_at:.2f}s")
         
         print(f"Final combined DataFrame shape: {combined_df.shape}")
-        print(f"Final columns: {list(combined_df.columns)}")
+        print(f"Final columns: {list(combined_df.columns[:10])}")
         large_data_mode = is_large_dataset(combined_df)
         print(f"Large dataset mode: {large_data_mode}")
 

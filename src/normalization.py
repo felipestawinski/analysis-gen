@@ -37,15 +37,24 @@ def detect_file_type(
     return "csv"
 
 
+def _is_text_dtype(col_or_dtype) -> bool:
+    """Return True for both legacy object dtype AND pandas 3.x StringDtype."""
+    return (
+        pd.api.types.is_object_dtype(col_or_dtype)
+        or pd.api.types.is_string_dtype(col_or_dtype)
+    )
+
+
 def _try_convert_comma_decimals(df: pd.DataFrame) -> pd.DataFrame:
-    """Detect object columns with comma-decimal numbers (e.g. ``'1234,56'``
+    """Detect object/string columns with comma-decimal numbers (e.g. ``'1234,56'``
     for 1234.56, common in Brazilian/European CSVs) and convert to float64.
 
     Only converts when >50 % of non-empty values match the comma-decimal
     pattern.  Values without a comma are parsed with dot-as-decimal to
     avoid mangling values like ``'4.0'``.
     """
-    for col in list(df.select_dtypes(include="object").columns):
+    text_cols = [c for c in df.columns if _is_text_dtype(df[c])]
+    for col in text_cols:
         non_null = df[col].dropna()
         if non_null.empty:
             continue
@@ -106,7 +115,7 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # object dtype whenever they contain even a single NaN, which breaks
     # downstream column-type detection (e.g. _select_relevant_columns).
     for column in normalized.columns:
-        if pd.api.types.is_object_dtype(normalized[column]):
+        if _is_text_dtype(normalized[column]):
             normalized[column] = normalized[column].fillna("").astype(str).str.strip()
 
     return normalized
@@ -141,10 +150,25 @@ def dataframe_from_bytes(file_bytes: bytes, file_type: str) -> pd.DataFrame:
 
 
 def dataframe_preview(df: pd.DataFrame, max_rows: int = 20, max_cols: int = 12) -> Tuple[list[str], list[list[str]]]:
-    safe_rows = max(1, min(max_rows, 100))
-    safe_cols = max(1, min(max_cols, 50))
+    import math
 
-    limited = df.iloc[:safe_rows, :safe_cols].astype(str)
+    safe_rows = max(1, min(max_rows, 200))
+    safe_cols = max(1, min(max_cols, 100))
+
+    limited = df.iloc[:safe_rows, :safe_cols]
     headers = [str(column) for column in limited.columns]
-    rows = limited.values.tolist()
+
+    def _safe_str(val) -> str:
+        if val is None:
+            return ""
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return ""
+        s = str(val)
+        return "" if s == "nan" else s
+
+    rows = [
+        [_safe_str(cell) for cell in row]
+        for row in limited.values.tolist()
+    ]
     return headers, rows
+

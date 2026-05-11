@@ -89,9 +89,11 @@ def _select_columns_for_rag(df: pd.DataFrame, max_columns: int = _MAX_RAG_COLUMN
     """Return a column-limited copy of *df* suitable for embedding.
 
     For files with more columns than *max_columns*, we keep:
-    - All non-numeric (categorical/text) columns (up to half the budget),
-      because they carry the most semantic meaning for search.
-    - Fill the rest with numeric columns.
+    1. **Identity columns first** — grouping / filtering columns (Player Name,
+       Date, RESULTADO FINAL, ADVERSÁRIO, etc.) are always included because
+       they carry the most semantic meaning for search queries.
+    2. Remaining categorical/text columns (up to half the remaining budget).
+    3. Fill the rest with numeric columns.
 
     This means a 700-column file is narrowed to ~80 columns, keeping the
     CSV text small enough for embedding while preserving search quality.
@@ -99,17 +101,41 @@ def _select_columns_for_rag(df: pd.DataFrame, max_columns: int = _MAX_RAG_COLUMN
     if len(df.columns) <= max_columns:
         return df
 
-    # Split into categorical and numeric
-    cat_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    # Import identity detection from context module
+    try:
+        from context import _detect_column_roles
+        roles = _detect_column_roles(df)
+        identity_cols = [c for c in roles["identity"] if c in df.columns]
+    except Exception:
+        identity_cols = []
 
-    # Allocate: up to half for categorical, rest for numeric
-    cat_budget = min(len(cat_cols), max_columns // 2)
-    num_budget = max_columns - cat_budget
+    selected: list[str] = []
+    seen: set[str] = set()
 
-    selected = cat_cols[:cat_budget] + num_cols[:num_budget]
-    print(f"[RAG] Wide file ({len(df.columns)} cols) -> trimmed to {len(selected)} cols for embedding")
-    return df[selected]
+    # 1. Force identity columns
+    for col in identity_cols:
+        if col not in seen:
+            selected.append(col)
+            seen.add(col)
+
+    remaining_budget = max_columns - len(selected)
+
+    # Split remaining columns into categorical and numeric
+    cat_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c not in seen]
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in seen]
+
+    # Allocate: up to half the remaining budget for categorical, rest for numeric
+    cat_budget = min(len(cat_cols), remaining_budget // 2)
+    num_budget = remaining_budget - cat_budget
+
+    for col in cat_cols[:cat_budget]:
+        selected.append(col)
+    for col in num_cols[:num_budget]:
+        selected.append(col)
+
+    print(f"[RAG] Wide file ({len(df.columns)} cols) -> trimmed to {len(selected)} cols "
+          f"for embedding (identity={len(identity_cols)}, cat={cat_budget}, num={num_budget})")
+    return df[selected[:max_columns]]
 
 
 def _dataframe_chunk_to_text(df_chunk: pd.DataFrame) -> str:
